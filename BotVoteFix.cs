@@ -73,7 +73,9 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     public void OnConfigParsed(BotVoteFixConfig config)
     {
         config.RefreshIntervalSeconds = Math.Clamp(config.RefreshIntervalSeconds, 0.05f, 1.0f);
-        config.MinimumPotentialVotes = Math.Clamp(config.MinimumPotentialVotes, 0, Server.MaxPlayers);
+        // Server.MaxPlayers is a native global and is not initialized while
+        // CounterStrikeSharp is loading plugin configuration.
+        config.MinimumPotentialVotes = Math.Max(config.MinimumPotentialVotes, 0);
         Config = config;
     }
 
@@ -121,10 +123,11 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         if (controller == null)
             return;
 
+        var maxSlots = controller.VotesCast.Length;
         var eligibleSlots = Utilities.GetPlayers()
             .Where(player => IsEligibleVoter(player, _botHiderApi))
             .Select(player => player.Slot)
-            .Where(slot => slot >= 0 && slot < Server.MaxPlayers)
+            .Where(slot => slot >= 0 && slot < maxSlots)
             .ToHashSet();
 
         var potentialVotes = Math.Max(eligibleSlots.Count, Config.MinimumPotentialVotes);
@@ -132,7 +135,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
         // Rebuild counts from eligible slots. This also removes votes left by bots,
         // BotHider clients, and players who disconnected during the vote.
-        for (var slot = 0; slot < Server.MaxPlayers; slot++)
+        for (var slot = 0; slot < maxSlots; slot++)
         {
             var cast = controller.VotesCast[slot];
             if (!eligibleSlots.Contains(slot))
