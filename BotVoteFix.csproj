@@ -13,7 +13,7 @@
       <Private>false</Private>
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
-    <ProjectReference Include="..\CS2-Bot-Hider\csharp\BotHiderApi\BotHiderApi.csproj">
+    <ProjectReference Include="..\CS2-Bot-Identity\csharp\BotIdentityApi\BotIdentityApi.csproj">
       <Private>false</Private>
     </ProjectReference>
   </ItemGroup>

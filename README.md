@@ -7,8 +7,12 @@ native vote lifecycle.
 ## Requirements
 
 - CounterStrikeSharp API 1.0.371 or a compatible release targeting `net10.0`
-- BotHider's `BotHiderApi` assembly when BotHider is installed
-- CS2 server with `game/csgo/addons/counterstrikesharp/`
+- `CS2-Bot-Identity` (native plugin) installed and loaded
+- `BotIdentityApi` shared assembly provided by `CS2-Bot-Identity`
+
+The plugin reads managed-bot metadata from the `botidentity:api`
+capability published by `CS2-Bot-Identity` (via the `/dev/shm/CS2BotHider_Slots`
+shared region the native plugin writes).
 
 Build with:
 
@@ -18,6 +22,11 @@ dotnet build -c Release
 
 Copy `bin/Release/net10.0/BotVoteFix.dll` to:
 `game/csgo/addons/counterstrikesharp/plugins/BotVoteFix/`.
+
+The DLL must be directly inside that directory, not in a nested
+`BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
+with `css_plugins list` and look for the startup line containing
+`Bot Vote Fix v1.1.0`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.
@@ -31,24 +40,22 @@ The generated configuration is in:
   to prevent a zero-player vote from being treated as an immediate pass.
 
 The voter pool excludes invalid clients, HLTV, native bots, and any slot where
-BotHider's `bothider:api` reports `IsManagedBot(slot) == true`.
+`botidentity:api` reports `IsManagedBot(slot) == true`.
 
-### BotHider compatibility
+Vote tracking is armed from `vote_options` as well as `vote_started`; the former
+is emitted earlier in the native vote creation path. The first reconciliation is
+performed synchronously and subsequent passes run on the configured timer. The
+plugin logs `[VoteFix] Native vote tracking armed by ...` when this path is active.
 
-Use BotHider's native-bot identity mode. On the current BotHider branch this is
-`"identity_mode": "bot"`; BotHider PR #28 adds `"native_bot"` as the canonical
-spelling while retaining `"bot"` as an alias. In `player` mode BotHider removes
-Valve's native fake-client markers, so the
-engine and other plugins can count managed bots as real players. That mode can
-cause native votes to time out and can conflict with `bot_quota` or cross-map
-population changes. Vote Improver no longer installs a native identity hook;
-it relies on Valve's native bot classification and the BotHider API for
-bookkeeping.
+### Bot-Identity compatibility
 
-BotHider 兼容性：请使用原生 Bot 身份模式。当前分支使用
-`"identity_mode": "bot"`，PR #28 合并后可使用 `"native_bot"`；`player` 模式会
-移除 Valve 的原生 Bot 标志，可能造成原生投票超时，并与 `bot_quota` 或跨地图
-人口管理冲突。
+This plugin uses the `botidentity:api` capability exclusively and does not
+depend on the legacy `bothider:api`. The voter pool is recomputed against
+the snapshot the native plugin published at vote start, then re-validated
+each tick against the current `Incarnation` value — a slot that was a
+managed bot at vote start but has since been re-used is correctly reclassified
+as eligible. If the native plugin is not loaded, the plugin falls back to
+the engine's `IsBot` flag and logs a warning at startup.
 
 ## Scope and limitations
 
@@ -56,6 +63,12 @@ This changes the native controller's potential-vote denominator and removes
 non-human cast entries while a vote is active. It does not make bots cast a
 choice and it does not replace the server's vote policy (`sv_vote_quorum_ratio`,
 issue permissions, or vote-specific rules).
+
+If no `[VoteFix] Bot Vote Fix loaded` or `Native vote tracking armed` message is
+present after loading the DLL, the server is running a different plugin copy or
+the plugin did not load; native vote behavior cannot be diagnosed from the HUD
+alone. A live test must also confirm the first `Eligible voters` count in the
+server log, using the exact CounterStrikeSharp and CS2 builds in production.
 
 The plugin must be tested against the exact CS2 build and other vote plugins
 running on the server. Plugins that overwrite `CVoteController` every frame,
