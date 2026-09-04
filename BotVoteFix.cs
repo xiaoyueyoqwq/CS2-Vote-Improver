@@ -131,6 +131,11 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
     private HookResult OnVoteCast(EventVoteCast @event, GameEventInfo info)
     {
+        Logger.LogInformation("[VoteFix] vote_cast: voter={Voter} slot={Slot} option={Option} team={Team}",
+            @event.Userid?.PlayerName ?? "?",
+            @event.Userid?.Slot ?? -1,
+            @event.VoteOption,
+            @event.Team);
         if (!_voteActive)
             ArmVote("vote_cast");
         return HookResult.Continue;
@@ -186,6 +191,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
     private HookResult OnVoteFinished(GameEvent @event, GameEventInfo info)
     {
+        Logger.LogInformation("[VoteFix] vote finished: {Event}", @event.EventName);
         StopRefreshing();
         return HookResult.Continue;
     }
