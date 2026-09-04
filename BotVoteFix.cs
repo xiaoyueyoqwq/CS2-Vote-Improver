@@ -34,6 +34,8 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private bool _voteArmLogged;
     private int _lastPotentialVotes = -1;
     private readonly int[] _lastOptionCounts = new int[5];
+    private int _lastEligibleCount = -1;
+    private int _lastEligibleTotal = -1;
 
     /// <summary>
     /// Snapshot of managed bot slots captured at vote start. Used to
@@ -44,7 +46,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private Dictionary<int, ulong>? _managedBotIncarnations;
 
     public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.1.1";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Excludes managed bots (via the botidentity:api capability) from native vote quorum.";
@@ -108,7 +110,16 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private HookResult OnVoteOptions(EventVoteOptions @event, GameEventInfo info)
     {
         ArmVote("vote_options");
-        RefreshVote();
+        try
+        {
+            RefreshVote();
+        }
+        catch (Exception exception)
+        {
+            // A broken vote event payload (e.g. no eligible voters) must not
+            // kill the armed vote-tracking state.
+            Logger.LogError(exception, "[VoteFix] RefreshVote failed after vote_options");
+        }
         return HookResult.Continue;
     }
 
@@ -185,6 +196,8 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         _refreshTimer?.Kill();
         _refreshTimer = null;
         _lastPotentialVotes = -1;
+        _lastEligibleCount = -1;
+        _lastEligibleTotal = -1;
         Array.Fill(_lastOptionCounts, -1);
         _managedBotIncarnations = null;
         _voteArmLogged = false;
@@ -201,23 +214,21 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
         if (controller == null)
         {
-            Logger.LogInformation("[VoteFix] RefreshVote: controller not found");
+            // Vote controller vanished (vote ended or started but never completed).
+            // Stop refreshing to avoid spamming the log.
+            StopRefreshing();
+            Logger.LogInformation("[VoteFix] RefreshVote: controller vanished, stopping refresh loop");
             return;
         }
 
         var maxSlots = controller.VotesCast.Length;
         var allPlayers = Utilities.GetPlayers().Where(p => p.IsValid).ToList();
-        Logger.LogInformation("[VoteFix] RefreshVote: {PlayerCount} players, {CacheCount} cached bots",
-            allPlayers.Count, _managedBotIncarnations?.Count ?? 0);
 
         var eligibleSlots = allPlayers
             .Where(player => IsEligibleVoter(player, _botIdentityApi, _managedBotIncarnations))
             .Select(player => player.Slot)
             .Where(slot => slot >= 0 && slot < maxSlots)
             .ToHashSet();
-
-        Logger.LogInformation("[VoteFix] Eligible voters: {Count}/{Total}",
-            eligibleSlots.Count, allPlayers.Count);
 
         var potentialVotes = Math.Max(eligibleSlots.Count, Config.MinimumPotentialVotes);
         var optionCounts = new int[5];
@@ -246,6 +257,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         }
 
         var changed = controller.PotentialVotes != potentialVotes;
+        var oldPotential = controller.PotentialVotes;
         controller.PotentialVotes = potentialVotes;
 
         for (var option = 0; option < optionCounts.Length; option++)
@@ -258,28 +270,51 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         {
             Utilities.SetStateChanged(controller, "CVoteController", "m_nPotentialVotes");
             Utilities.SetStateChanged(controller, "CVoteController", "m_nVoteOptionCount");
+            Logger.LogInformation("[VoteFix] SetStateChanged: potential {Old} -> {New}, eligible {Eligible}/{Total} (threshold @ {Ratio:P0})",
+                oldPotential, potentialVotes, eligibleSlots.Count, allPlayers.Count, 0.501);
         }
+
         if (votesCastChanged)
             Utilities.SetStateChanged(controller, "CVoteController", "m_nVotesCast");
 
         if (!changed && !votesCastChanged && _lastPotentialVotes == potentialVotes)
             return;
 
+        var eligibleChanged = eligibleSlots.Count != _lastEligibleCount || allPlayers.Count != _lastEligibleTotal;
+        _lastEligibleCount = eligibleSlots.Count;
+        _lastEligibleTotal = allPlayers.Count;
+        if (eligibleChanged)
+        {
+            Logger.LogInformation("[VoteFix] Eligible voters: {Count}/{Total}",
+                eligibleSlots.Count, allPlayers.Count);
+        }
+
         _lastPotentialVotes = potentialVotes;
         Array.Copy(optionCounts, _lastOptionCounts, optionCounts.Length);
 
-        var changedEvent = new EventVoteChanged(false)
+        try
         {
-            Potentialvotes = potentialVotes,
-            VoteOption1 = optionCounts[0],
-            VoteOption2 = optionCounts[1],
-            VoteOption3 = optionCounts[2],
-            VoteOption4 = optionCounts[3],
-            VoteOption5 = optionCounts[4],
-            Yesvotes = optionCounts[0],
-            Novotes = optionCounts[1],
-        };
-        changedEvent.FireEvent(false);
+            var changedEvent = new EventVoteChanged(false)
+            {
+                Potentialvotes = potentialVotes,
+                VoteOption1 = optionCounts[0],
+                VoteOption2 = optionCounts[1],
+                VoteOption3 = optionCounts[2],
+                VoteOption4 = optionCounts[3],
+                VoteOption5 = optionCounts[4],
+                Yesvotes = optionCounts[0],
+                Novotes = optionCounts[1],
+            };
+            changedEvent.FireEvent(false);
+        }
+        catch (Exception exception)
+        {
+            // FireEvent can throw NativeException("Invalid game event") when
+            // the engine has no live vote event to clone (observed when the
+            // vote had zero eligible voters). The controller writes above are
+            // already applied; skip the client-side broadcast only.
+            Logger.LogDebug(exception, "[VoteFix] vote_changed broadcast skipped");
+        }
 
         Logger.LogDebug("Native vote quorum updated: potential={Potential}, yes={Yes}, no={No}",
             potentialVotes, optionCounts[0], optionCounts[1]);
