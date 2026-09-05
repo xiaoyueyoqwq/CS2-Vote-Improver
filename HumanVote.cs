@@ -17,8 +17,9 @@ public enum HumanVoteOutcome
 /// A yes/no vote that is displayed through the native Panorama vote HUD but
 /// whose electorate and tally are owned by the plugin. Valve's CVoteController
 /// is only used as the client-facing display state (the HUD reads
-/// m_nPotentialVotes / m_nVoteOptionCount, and the server only fires
-/// vote_cast for "vote optionN" while m_iActiveIssueIndex != -1).
+/// m_nPotentialVotes / m_nVoteOptionCount). Ballots come from the plugin's
+/// Pre listener on "vote option1/option2"; vote_cast is a fallback if the
+/// engine still fires it while m_iActiveIssueIndex != -1.
 /// </summary>
 public sealed class HumanVote
 {
@@ -99,8 +100,9 @@ public sealed class HumanVote
     }
 
     /// <summary>
-    /// Records a ballot from vote_cast. Returns false when the voter is not
-    /// part of the human electorate (bots, HLTV, other team, late joiners).
+    /// Records a ballot from "vote optionN" or vote_cast. Returns false when
+    /// the voter is not part of the human electorate (bots, HLTV, other team,
+    /// late joiners) or the slot already voted.
     /// </summary>
     public bool TryCast(int slot, int option, CVoteController? controller)
     {

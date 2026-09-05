@@ -22,9 +22,10 @@ Version 2.0 stops fighting the native issue. For a whitelisted issue the plugin:
    engine bots, and not `botidentity:api.IsManagedBot(slot)` (team issues
    filter by the caller's team);
 3. shows the native HUD to those players with the `VoteStart` user message,
-   and sets `CVoteController.m_iActiveIssueIndex` to a non-negative index so
-   the server keeps firing `vote_cast` for `vote option1/option2`
-   (the same technique CS2Fixes' PanoramaVote uses);
+   and listens to the client command `vote option1` / `vote option2` (F1/F2)
+   in a `Pre` command listener. `vote_cast` is kept as a fallback if the
+   engine still emits it (`m_iActiveIssueIndex` is set non-negative for HUD
+   compatibility, same as CS2Fixes' PanoramaVote);
 4. tallies only ballots from the electorate, publishes counts through
    `CVoteController.m_nVoteOptionCount` / `vote_changed`, and decides with
    `ceil(potential * sv_vote_quorum_ratio)` yes votes;
@@ -60,7 +61,7 @@ Copy `bin/Release/net10.0/BotVoteFix.dll` to:
 The DLL must be directly inside that directory, not in a nested
 `BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
 with `css_plugins list` and look for the startup line containing
-`Bot Vote Fix v2.0.0`.
+`Bot Vote Fix v2.0.1`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.

@@ -76,7 +76,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
     public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "2.0.0";
+    public override string ModuleVersion => "2.0.1";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
@@ -89,6 +89,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
             ModuleVersion, Config.Enabled);
 
         AddCommandListener("callvote", OnCallVote, HookMode.Pre);
+        AddCommandListener("vote", OnVoteCommand, HookMode.Pre);
         RegisterEventHandler<EventVoteCast>(OnVoteCast);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
@@ -111,6 +112,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     {
         CancelActiveVote("plugin unload");
         RemoveCommandListener("callvote", OnCallVote, HookMode.Pre);
+        RemoveCommandListener("vote", OnVoteCommand, HookMode.Pre);
         DeregisterEventHandler<EventVoteCast>(OnVoteCast);
         DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RemoveListener<Listeners.OnMapEnd>(OnMapEnd);
@@ -357,6 +359,25 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         if (early != null) Conclude(vote, early.Value);
     }
 
+    private HookResult OnVoteCommand(CCSPlayerController? caller, CommandInfo command)
+    {
+        var vote = _activeVote;
+        if (vote == null || vote.IsFinished) return HookResult.Continue;
+        if (caller == null || !caller.IsValid) return HookResult.Continue;
+        if (!TryParseVoteOption(command, out int option)) return HookResult.Continue;
+
+        try
+        {
+            ApplyBallot(caller.Slot, option);
+        }
+        catch (Exception exception)
+        {
+            Logger.LogError(exception, "[VoteFix] vote command tally failed for '{Args}'", command.ArgString);
+        }
+
+        return HookResult.Handled;
+    }
+
     private HookResult OnVoteCast(EventVoteCast @event, GameEventInfo info)
     {
         var vote = _activeVote;
@@ -365,13 +386,39 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         var voter = @event.Userid;
         if (voter == null || !voter.IsValid) return HookResult.Continue;
 
-        var controller = FindVoteController();
-        if (vote.TryCast(voter.Slot, @event.VoteOption, controller))
+        ApplyBallot(voter.Slot, @event.VoteOption);
+        return HookResult.Continue;
+    }
+
+    private void ApplyBallot(int slot, int option)
+    {
+        var vote = _activeVote;
+        if (vote == null || vote.IsFinished) return;
+
+        if (vote.TryCast(slot, option, FindVoteController()))
         {
             var early = vote.EvaluateEarly();
             if (early != null) Conclude(vote, early.Value);
         }
-        return HookResult.Continue;
+    }
+
+    private static bool TryParseVoteOption(CommandInfo command, out int option)
+    {
+        option = -1;
+        if (command.ArgCount < 2) return false;
+
+        string token = command.GetArg(1).Trim();
+        if (token.Equals("option1", StringComparison.OrdinalIgnoreCase))
+        {
+            option = 0;
+            return true;
+        }
+        if (token.Equals("option2", StringComparison.OrdinalIgnoreCase))
+        {
+            option = 1;
+            return true;
+        }
+        return false;
     }
 
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
