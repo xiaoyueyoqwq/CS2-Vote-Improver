@@ -29,9 +29,13 @@ Version 2.0 stops fighting the native issue. For a whitelisted issue the plugin:
 4. tallies only ballots from the electorate, publishes counts through
    `CVoteController.m_nVoteOptionCount` / `vote_changed`, and decides with
    `ceil(potential * sv_vote_quorum_ratio)` yes votes;
-5. sends `VotePass` and runs the issue's command (`changelevel <map>`,
-   `kickid <userid>`, `mp_restartgame 1`, `timeout_<team>_start`, ...), or
-   sends `VoteFailed` and starts the issue cooldown.
+5. sends `VotePass` and runs the issue's command (`game_alias <current>`
+   then `changelevel <map>`, `kickid <userid>`, `mp_restartgame 1`,
+   `timeout_<team>_start`, ...), or sends `VoteFailed` and starts the
+   issue cooldown. `ChangeLevel` reasserts the live `game_type`/`game_mode`
+   as a Valve `game_alias` first (same table as CS2-Switch-Gamemode) so a
+   bare `changelevel` does not leave the client/loading screen on the
+   War Games group.
 
 Anything not whitelisted (Surrender, unknown issues, votes called by bots,
 kick votes against bots, maps that fail `IsMapValid`, disabled
@@ -61,7 +65,7 @@ Copy `bin/Release/net10.0/BotVoteFix.dll` to:
 The DLL must be directly inside that directory, not in a nested
 `BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
 with `css_plugins list` and look for the startup line containing
-`Bot Vote Fix v2.0.1`.
+`Bot Vote Fix v2.0.2`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.
@@ -117,7 +121,9 @@ Issues missing from an existing config file are added disabled.
   engine not starting `m_acceptingVotesTimer`; this is build-sensitive
   (see `AGENTS.md`) and must be re-checked after CS2 updates together with
   any other plugin that touches `CVoteController`.
-- This build has **not** been validated on a live server. The acceptance
-  test is a `changelevel` vote with 1 human and player-mode bots: the log
-  must show `vote start ... potential=1 required=1`, then
-  `vote end ... outcome=Passed` and `executing 'changelevel ...'`.
+- 2.0.1 was checked live: console `vote option1` passed a `ChangeLevel`
+  vote (`potential=1`) and ran `changelevel`. F1 still depends on the
+  client bind. 2.0.2 adds `game_alias` before `changelevel`; confirm the
+  log shows `executing 'game_alias competitive' then 'changelevel ...'`
+  when the server is in competitive, and that the loading screen stays
+  on the current mode.

@@ -76,7 +76,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
     public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "2.0.1";
+    public override string ModuleVersion => "2.0.2";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
@@ -467,16 +467,75 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
             return;
         }
 
-        string commandText = vote.Request.BuildCommand();
-        if (string.IsNullOrWhiteSpace(commandText)) return;
-
         _executeTimer?.Kill();
         _executeTimer = AddTimer(Config.ExecuteDelaySeconds, () =>
         {
             _executeTimer = null;
-            Logger.LogInformation("[VoteFix] executing '{Command}' for passed {Issue} vote", commandText, vote.Request.IssueType);
-            Server.ExecuteCommand(commandText);
+            ExecutePassedCommand(vote.Request);
         });
+    }
+
+    private void ExecutePassedCommand(CallVoteRequest request)
+    {
+        string commandText = request.BuildCommand();
+        if (string.IsNullOrWhiteSpace(commandText)) return;
+
+        if (string.Equals(request.IssueType, "ChangeLevel", StringComparison.OrdinalIgnoreCase))
+        {
+            string? alias = CurrentGameAlias();
+            if (alias != null)
+            {
+                Logger.LogInformation(
+                    "[VoteFix] executing 'game_alias {Alias}' then '{Command}' for passed {Issue} vote",
+                    alias, commandText, request.IssueType);
+                Server.ExecuteCommand($"game_alias {alias}");
+            }
+            else
+            {
+                Logger.LogWarning(
+                    "[VoteFix] current game_type/game_mode has no alias; executing '{Command}' without game_alias",
+                    commandText);
+            }
+        }
+        else
+        {
+            Logger.LogInformation("[VoteFix] executing '{Command}' for passed {Issue} vote",
+                commandText, request.IssueType);
+        }
+
+        Server.ExecuteCommand(commandText);
+    }
+
+    /// <summary>
+    /// Maps the live game_type/game_mode pair to a Valve game_alias.
+    /// Same table CS2-Switch-Gamemode uses. Null = unknown, do not guess.
+    /// </summary>
+    private static string? CurrentGameAlias()
+    {
+        var type = ConVar.Find("game_type");
+        var mode = ConVar.Find("game_mode");
+        if (type == null || mode == null) return null;
+
+        try
+        {
+            return (type.GetPrimitiveValue<int>(), mode.GetPrimitiveValue<int>()) switch
+            {
+                (0, 0) => "casual",
+                (0, 1) => "competitive",
+                (0, 2) => "wingman",
+                (0, 5) => "retakes",
+                (1, 0) => "armsrace",
+                (1, 1) => "demolition",
+                (1, 2) => "deathmatch",
+                (2, 0) => "training",
+                (3, 0) => "custom",
+                _ => null,
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private void CancelActiveVote(string reason)
