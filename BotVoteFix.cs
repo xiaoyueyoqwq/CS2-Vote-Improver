@@ -4,9 +4,10 @@ using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Core.Capabilities;
-using CounterStrikeSharp.API.Modules.Events;
-using CounterStrikeSharp.API.Modules.Memory;
-using CounterStrikeSharp.API.Modules.Timers;
+using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.UserMessages;
+using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 using CssTimer = CounterStrikeSharp.API.Modules.Timers.Timer;
 
@@ -17,42 +18,68 @@ public sealed class BotVoteFixConfig : BasePluginConfig
     [JsonPropertyName("Enabled")]
     public bool Enabled { get; set; } = true;
 
-    [JsonPropertyName("RefreshIntervalSeconds")]
-    public float RefreshIntervalSeconds { get; set; } = 0.10f;
+    /// <summary>Overrides sv_vote_timer_duration when &gt; 0.</summary>
+    [JsonPropertyName("VoteDurationSeconds")]
+    public float VoteDurationSeconds { get; set; } = 0f;
 
-    [JsonPropertyName("MinimumPotentialVotes")]
-    public int MinimumPotentialVotes { get; set; } = 1;
+    /// <summary>Overrides sv_vote_quorum_ratio when &gt; 0.</summary>
+    [JsonPropertyName("QuorumRatio")]
+    public float QuorumRatio { get; set; } = 0f;
+
+    /// <summary>Overrides sv_vote_failure_timer when &gt;= 0.</summary>
+    [JsonPropertyName("FailureCooldownSeconds")]
+    public float FailureCooldownSeconds { get; set; } = -1f;
+
+    /// <summary>Overrides sv_vote_creation_timer when &gt;= 0.</summary>
+    [JsonPropertyName("CallerCooldownSeconds")]
+    public float CallerCooldownSeconds { get; set; } = -1f;
+
+    /// <summary>Delay between VotePass and executing the command.</summary>
+    [JsonPropertyName("ExecuteDelaySeconds")]
+    public float ExecuteDelaySeconds { get; set; } = 3f;
+
+    /// <summary>
+    /// When the botidentity:api capability is missing, fall back to the
+    /// engine's IsBot flag only (managed bots in player mode will then count).
+    /// Set to false to refuse takeover without the API.
+    /// </summary>
+    [JsonPropertyName("AllowWithoutBotIdentityApi")]
+    public bool AllowWithoutBotIdentityApi { get; set; } = true;
+
+    [JsonPropertyName("Issues")]
+    public Dictionary<string, IssueConfig> Issues { get; set; } = IssueConfig.Defaults();
 }
 
+/// <summary>
+/// Takes over whitelisted <c>callvote</c> issues so that only humans form
+/// the electorate. Valve's own vote quorum counts managed bots and none of
+/// the identity-field rewrites tried in 1.x changed that (see
+/// docs/HANDOVER-FABLE-5.1.md §7), so instead of a native issue we run a
+/// plugin-owned yes/no vote on the native Panorama HUD and execute the
+/// issue's command ourselves when it passes.
+/// </summary>
 [MinimumApiVersion(334)]
 public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 {
-    private const int UncastVote = 5;
+    private const float DefaultVoteDuration = 15f;
+    private const float DefaultQuorumRatio = 0.501f;
+    private const float DefaultFailureCooldown = 300f;
+    private const float DefaultCallerCooldown = 150f;
 
-    private CssTimer? _refreshTimer;
+    private static readonly PluginCapability<IBotIdentityApi> CapabilityToken = new("botidentity:api");
+
     private IBotIdentityApi? _botIdentityApi;
-    private bool _voteActive;
-    private bool _voteArmLogged;
-    private int _lastPotentialVotes = -1;
-    private readonly int[] _lastOptionCounts = new int[5];
-    private int _lastEligibleCount = -1;
-    private int _lastEligibleTotal = -1;
-
-    /// <summary>
-    /// Snapshot of managed bot slots captured at vote start. Used to
-    /// validate per-slot incarnation so a slot reuse during the vote
-    /// (player disconnect, manual bot_kick) doesn't accidentally
-    /// include a fresh human voter.
-    /// </summary>
-    private Dictionary<int, ulong>? _managedBotIncarnations;
-    private Dictionary<int, ulong>? _schemaSteamIdSnapshots;
-    private bool _schemaOffsetLogged;
+    private HumanVote? _activeVote;
+    private CssTimer? _timeoutTimer;
+    private CssTimer? _executeTimer;
+    private readonly Dictionary<string, float> _issueCooldownUntil = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
     public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "1.1.2";
+    public override string ModuleVersion => "2.0.0";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
-        "Excludes managed bots (via the botidentity:api capability) from native vote quorum.";
+        "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
 
     public BotVoteFixConfig Config { get; set; } = new();
 
@@ -60,398 +87,423 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     {
         Logger.LogInformation("[VoteFix] Loading Bot Vote Fix v{Version}. Enabled={Enabled}",
             ModuleVersion, Config.Enabled);
-        try
+
+        AddCommandListener("callvote", OnCallVote, HookMode.Pre);
+        RegisterEventHandler<EventVoteCast>(OnVoteCast);
+        RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
+        RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
+
+        if (hotReload)
         {
-            RegisterEventHandler<EventVoteOptions>(OnVoteOptions);
-            RegisterEventHandler<EventVoteStarted>(OnVoteStarted);
-            RegisterEventHandler<EventVoteCast>(OnVoteCast);
-            RegisterEventHandler<EventVoteEnded>(OnVoteFinished);
-            RegisterEventHandler<EventVotePassed>(OnVoteFinished);
-            RegisterEventHandler<EventVoteFailed>(OnVoteFinished);
-            Logger.LogInformation("[VoteFix] Event handlers registered: VoteOptions, VoteStarted, VoteCast, VoteEnded, VotePassed, VoteFailed");
-        }
-        catch (Exception exception)
-        {
-            Logger.LogError(exception, "[VoteFix] Event handler registration failed; plugin will not be usable");
-            throw;
+            _botIdentityApi = ResolveBotIdentityApi();
         }
     }
 
     public override void OnAllPluginsLoaded(bool hotReload)
     {
-        try { _botIdentityApi = CapabilityToken.Get(); }
-        catch { _botIdentityApi = null; }
-        Logger.LogInformation("botidentity:api {State}; managed bots will {Treatment}.",
+        _botIdentityApi = ResolveBotIdentityApi();
+        Logger.LogInformation("[VoteFix] botidentity:api {State}; managed bots will {Treatment}.",
             _botIdentityApi == null ? "not available" : "available",
-            _botIdentityApi == null ? "fall back to engine IsBot" : "be excluded explicitly");
+            _botIdentityApi == null ? "only be excluded when the engine flags them as bots" : "be excluded explicitly");
     }
 
     public override void Unload(bool hotReload)
     {
-        _refreshTimer?.Kill();
-        _refreshTimer = null;
-        DeregisterEventHandler<EventVoteOptions>(OnVoteOptions);
-        DeregisterEventHandler<EventVoteStarted>(OnVoteStarted);
+        CancelActiveVote("plugin unload");
+        RemoveCommandListener("callvote", OnCallVote, HookMode.Pre);
         DeregisterEventHandler<EventVoteCast>(OnVoteCast);
-        DeregisterEventHandler<EventVoteEnded>(OnVoteFinished);
-        DeregisterEventHandler<EventVotePassed>(OnVoteFinished);
-        DeregisterEventHandler<EventVoteFailed>(OnVoteFinished);
+        DeregisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
+        RemoveListener<Listeners.OnMapEnd>(OnMapEnd);
     }
 
     public void OnConfigParsed(BotVoteFixConfig config)
     {
-        config.RefreshIntervalSeconds = Math.Clamp(config.RefreshIntervalSeconds, 0.05f, 1.0f);
-        config.MinimumPotentialVotes = Math.Max(config.MinimumPotentialVotes, 0);
+        config.ExecuteDelaySeconds = Math.Clamp(config.ExecuteDelaySeconds, 0f, 30f);
+        config.Issues ??= IssueConfig.Defaults();
+        foreach (var (name, defaults) in IssueConfig.Defaults())
+        {
+            if (!config.Issues.ContainsKey(name))
+            {
+                defaults.Enabled = false;
+                config.Issues[name] = defaults;
+            }
+        }
         Config = config;
     }
 
-    // Capability token. CounterStrikeSharp disambiguates the same token
-    // string across plugins; we use the API's full type name to match
-    // the publisher registration in CS2-Bot-Identity.
-    private static readonly PluginCapability<IBotIdentityApi> CapabilityToken = new("botidentity:api");
-
-    private HookResult OnVoteOptions(EventVoteOptions @event, GameEventInfo info)
+    private IBotIdentityApi? ResolveBotIdentityApi()
     {
-        ArmVote("vote_options");
+        try { return CapabilityToken.Get(); }
+        catch { return null; }
+    }
+
+    // ---------------------------------------------------------------------
+    // callvote interception
+    // ---------------------------------------------------------------------
+
+    private HookResult OnCallVote(CCSPlayerController? caller, CommandInfo command)
+    {
+        if (!Config.Enabled) return HookResult.Continue;
+        if (caller == null || !caller.IsValid) return HookResult.Continue;
+        if (command.ArgCount < 2) return HookResult.Continue;
+
         try
         {
-            RefreshVote();
+            return HandleCallVote(caller, command);
         }
         catch (Exception exception)
         {
-            // A broken vote event payload (e.g. no eligible voters) must not
-            // kill the armed vote-tracking state.
-            Logger.LogError(exception, "[VoteFix] RefreshVote failed after vote_options");
+            Logger.LogError(exception, "[VoteFix] callvote takeover failed; passing '{Args}' to the native handler", command.ArgString);
+            return HookResult.Continue;
         }
-        return HookResult.Continue;
     }
 
-    private HookResult OnVoteStarted(EventVoteStarted @event, GameEventInfo info)
+    private HookResult HandleCallVote(CCSPlayerController caller, CommandInfo command)
     {
-        ArmVote("vote_started");
-        return HookResult.Continue;
+        string issueType = command.GetArg(1).Trim();
+        if (!Config.Issues.TryGetValue(issueType, out var issue) || !issue.Enabled || string.IsNullOrWhiteSpace(issue.Command))
+        {
+            Logger.LogDebug("[VoteFix] callvote {Issue}: not whitelisted, native handles it", issueType);
+            return HookResult.Continue;
+        }
+
+        if (!string.IsNullOrEmpty(issue.AllowConVar))
+        {
+            var allow = ConVar.Find(issue.AllowConVar);
+            if (allow != null && !allow.GetPrimitiveValue<bool>())
+            {
+                Logger.LogDebug("[VoteFix] callvote {Issue}: {ConVar} is 0, native handles it", issueType, issue.AllowConVar);
+                return HookResult.Continue;
+            }
+        }
+
+        // Managed bots never call votes on their own; a native bot or HLTV should stay on the native path.
+        if (caller.IsHLTV || caller.IsBot || _botIdentityApi?.IsManagedBot(caller.Slot) == true)
+            return HookResult.Continue;
+
+        if (_botIdentityApi == null && !Config.AllowWithoutBotIdentityApi)
+        {
+            Logger.LogWarning("[VoteFix] callvote {Issue}: botidentity:api unavailable and AllowWithoutBotIdentityApi=false, native handles it", issueType);
+            return HookResult.Continue;
+        }
+
+        var controller = FindVoteController();
+        if (controller != null && controller.IsValid && controller.ActiveIssueIndex >= 0 && _activeVote == null)
+        {
+            Logger.LogDebug("[VoteFix] callvote {Issue}: a native vote is active, native handles it", issueType);
+            return HookResult.Continue;
+        }
+
+        string details = JoinArgs(command, 2);
+        var callerTeam = caller.Team;
+
+        if (callerTeam != CsTeam.Terrorist && callerTeam != CsTeam.CounterTerrorist)
+        {
+            var allowSpectators = ConVar.Find("sv_vote_allow_spectators");
+            if (allowSpectators == null || !allowSpectators.GetPrimitiveValue<bool>())
+                return RejectCall(caller, VoteFailReason.Spectator);
+        }
+
+        if (_activeVote != null)
+            return RejectCall(caller, VoteFailReason.Generic);
+
+        float now = Server.CurrentTime;
+        if (caller.SteamID != 0 && _callerCooldownUntil.TryGetValue(caller.SteamID, out float callerUntil) && callerUntil > now)
+            return RejectCall(caller, VoteFailReason.RateExceeded, (int)Math.Ceiling(callerUntil - now));
+
+        int targetUserId = -1;
+        int targetSlot = -1;
+        string detailsForUi = details;
+
+        if (string.Equals(issueType, "Kick", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!CallVoteRequest.TryParseKickTarget(details, out targetUserId))
+                return RejectCall(caller, VoteFailReason.PlayerNotFound);
+
+            var target = Utilities.GetPlayerFromUserid(targetUserId);
+            if (target == null || !target.IsValid || target.Connected != PlayerConnectedState.Connected)
+                return RejectCall(caller, VoteFailReason.PlayerNotFound);
+
+            // Kicking bots (managed or native) stays on the native path.
+            if (target.IsBot || target.IsHLTV || _botIdentityApi?.IsManagedBot(target.Slot) == true)
+                return HookResult.Continue;
+
+            targetSlot = target.Slot;
+            detailsForUi = target.PlayerName;
+        }
+        else if (string.Equals(issueType, "ChangeLevel", StringComparison.OrdinalIgnoreCase)
+                 || string.Equals(issueType, "NextLevel", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(details) || !IsSafeMapName(details))
+                return RejectCall(caller, VoteFailReason.MapNotFound);
+            if (!Server.IsMapValid(details))
+            {
+                // Workshop / unknown names: let the native issue decide instead of guessing.
+                Logger.LogInformation("[VoteFix] callvote {Issue} '{Map}': IsMapValid=false, native handles it", issueType, details);
+                return HookResult.Continue;
+            }
+        }
+
+        var request = new CallVoteRequest
+        {
+            IssueType = issueType,
+            Details = details,
+            DetailsForUi = detailsForUi,
+            Issue = issue,
+            CallerSlot = caller.Slot,
+            CallerTeam = callerTeam,
+            TargetUserId = targetUserId,
+            TargetSlot = targetSlot,
+        };
+
+        if (_issueCooldownUntil.TryGetValue(request.CooldownKey, out float issueUntil) && issueUntil > now)
+            return RejectCall(caller, issue.FailedRecentlyReason, (int)Math.Ceiling(issueUntil - now));
+
+        var voters = CollectHumanVoters(request);
+        if (voters.Count == 0)
+        {
+            Logger.LogWarning("[VoteFix] callvote {Issue}: no human voters found (caller slot {Slot}); native handles it",
+                issueType, caller.Slot);
+            return HookResult.Continue;
+        }
+
+        StartVote(request, voters, controller);
+        if (caller.SteamID != 0)
+            _callerCooldownUntil[caller.SteamID] = now + CallerCooldown();
+        return HookResult.Handled;
+    }
+
+    private HookResult RejectCall(CCSPlayerController caller, int reason, int seconds = 0)
+    {
+        var failed = UserMessage.FromId(HumanVote.UmCallVoteFailed);
+        failed.SetInt("reason", reason);
+        failed.SetInt("time", seconds);
+        failed.Send(new RecipientFilter(caller));
+        Logger.LogInformation("[VoteFix] callvote rejected for slot {Slot}: reason={Reason} time={Time}",
+            caller.Slot, reason, seconds);
+        return HookResult.Handled;
+    }
+
+    private static string JoinArgs(CommandInfo command, int startIndex)
+    {
+        var parts = new List<string>();
+        for (int i = startIndex; i < command.ArgCount; i++)
+        {
+            string arg = command.GetArg(i).Trim();
+            if (arg.Length > 0) parts.Add(arg);
+        }
+        return string.Join(' ', parts);
+    }
+
+    private static bool IsSafeMapName(string map)
+    {
+        if (map.Length > 64) return false;
+        foreach (char c in map)
+        {
+            if (!(char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '/'))
+                return false;
+        }
+        return !map.Contains("..", StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------
+    // electorate
+    // ---------------------------------------------------------------------
+
+    private List<int> CollectHumanVoters(CallVoteRequest request)
+    {
+        var voters = new List<int>();
+        var api = _botIdentityApi;
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (!IsHumanVoter(player, api)) continue;
+            if (request.IsTeamVote && player.Team != request.CallerTeam) continue;
+            voters.Add(player.Slot);
+        }
+        return voters;
+    }
+
+    // Managed bots in player mode have m_bFakePlayer cleared by the native
+    // BotIdentity plugin, so IsBot alone cannot see them; botidentity:api is
+    // the authoritative source and IsBot only catches un-managed native bots.
+    private static bool IsHumanVoter(CCSPlayerController player, IBotIdentityApi? api)
+    {
+        if (!player.IsValid || player.IsHLTV) return false;
+        if (player.Connected != PlayerConnectedState.Connected) return false;
+        if (player.IsBot) return false;
+        if (api?.IsManagedBot(player.Slot) == true) return false;
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
+    // vote lifecycle
+    // ---------------------------------------------------------------------
+
+    private void StartVote(CallVoteRequest request, List<int> voters, CVoteController? controller)
+    {
+        var vote = new HumanVote(request, voters, QuorumRatio(), message => Logger.LogInformation("[VoteFix] {Message}", message));
+        _activeVote = vote;
+        vote.Start(controller);
+
+        float duration = VoteDuration();
+        _timeoutTimer?.Kill();
+        _timeoutTimer = AddTimer(duration, () =>
+        {
+            if (!ReferenceEquals(_activeVote, vote) || vote.IsFinished) return;
+            Conclude(vote, vote.EvaluateAtTimeout());
+        });
+
+        var early = vote.EvaluateEarly();
+        if (early != null) Conclude(vote, early.Value);
     }
 
     private HookResult OnVoteCast(EventVoteCast @event, GameEventInfo info)
     {
-        Logger.LogInformation("[VoteFix] vote_cast: voter={Voter} slot={Slot} option={Option} team={Team}",
-            @event.Userid?.PlayerName ?? "?",
-            @event.Userid?.Slot ?? -1,
-            @event.VoteOption,
-            @event.Team);
-        if (!_voteActive)
-            ArmVote("vote_cast");
+        var vote = _activeVote;
+        if (vote == null || vote.IsFinished) return HookResult.Continue;
+
+        var voter = @event.Userid;
+        if (voter == null || !voter.IsValid) return HookResult.Continue;
+
+        var controller = FindVoteController();
+        if (vote.TryCast(voter.Slot, @event.VoteOption, controller))
+        {
+            var early = vote.EvaluateEarly();
+            if (early != null) Conclude(vote, early.Value);
+        }
         return HookResult.Continue;
     }
 
-    private void ArmVote(string source)
+    private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
-        if (!Config.Enabled)
+        var vote = _activeVote;
+        var player = @event.Userid;
+        if (vote == null || vote.IsFinished || player == null) return HookResult.Continue;
+
+        if (vote.Request.TargetSlot >= 0 && vote.Request.TargetSlot == player.Slot)
         {
-            if (!_voteArmLogged)
-            {
-                Logger.LogInformation("[VoteFix] vote trigger received from {Source}, but the fix is disabled", source);
-                _voteArmLogged = true;
-            }
-            return;
+            Logger.LogInformation("[VoteFix] kick target left during vote; cancelling");
+            Conclude(vote, HumanVoteOutcome.Cancelled);
+            return HookResult.Continue;
         }
 
-        if (_voteActive)
-            return;
+        if (!vote.IsVoter(player.Slot)) return HookResult.Continue;
 
-        _voteActive = true;
-        _voteArmLogged = true;
-        _lastPotentialVotes = -1;
-        Array.Fill(_lastOptionCounts, -1);
-
-        Logger.LogInformation("[VoteFix] Native vote tracking armed by {Source}; preparing managed-bot snapshot", source);
-
-        // Capture the managed-bot slot→incarnation map at vote start.
-        // If a slot is reused by a real human during the vote, the
-        // incarnation changes and the slot is no longer treated as
-        // managed.
-        if (_botIdentityApi != null)
-        {
-            var snapshots = _botIdentityApi.GetManagedBotSnapshots();
-            _managedBotIncarnations = new Dictionary<int, ulong>();
-            foreach (var snapshot in snapshots)
-            {
-                _managedBotIncarnations[snapshot.Slot] = snapshot.Incarnation;
-            }
-            Logger.LogInformation("[VoteFix] Cached {Count} managed bot snapshots for vote", snapshots.Length);
-        }
-        else
-        {
-            Logger.LogInformation("[VoteFix] botidentity:api not available at vote start; using engine IsBot only");
-        }
-
-        _refreshTimer?.Kill();
-        _refreshTimer = AddTimer(Config.RefreshIntervalSeconds, RefreshVote, TimerFlags.REPEAT);
-        Logger.LogInformation("[VoteFix] Starting refresh timer with interval {Interval}s", Config.RefreshIntervalSeconds);
-
-        // Zero schema SteamID on this call stack, before vote_options returns
-        // and Valve's first Think writes potential. Do not wait for NextFrame.
-        CaptureAndZeroManagedSteamIds();
-        AddTimer(0.0f, RefreshVote);
-    }
-
-    private HookResult OnVoteFinished(GameEvent @event, GameEventInfo info)
-    {
-        Logger.LogInformation("[VoteFix] vote finished: {Event}", @event.EventName);
-        StopRefreshing();
+        vote.RemoveVoter(player.Slot, FindVoteController());
+        var early = vote.EvaluateEarly();
+        if (early != null) Conclude(vote, early.Value);
         return HookResult.Continue;
     }
 
-    private void StopRefreshing()
+    private void OnMapEnd()
     {
-        RestoreManagedSteamIds();
-        _voteActive = false;
-        _refreshTimer?.Kill();
-        _refreshTimer = null;
-        _lastPotentialVotes = -1;
-        _lastEligibleCount = -1;
-        _lastEligibleTotal = -1;
-        Array.Fill(_lastOptionCounts, -1);
-        _managedBotIncarnations = null;
-        _voteArmLogged = false;
+        CancelActiveVote("map end");
+        _issueCooldownUntil.Clear();
+        _callerCooldownUntil.Clear();
     }
 
-    private void CaptureAndZeroManagedSteamIds()
+    private void Conclude(HumanVote vote, HumanVoteOutcome outcome)
     {
-        if (_managedBotIncarnations == null || _managedBotIncarnations.Count == 0)
-            return;
+        if (!ReferenceEquals(_activeVote, vote)) return;
 
-        _schemaSteamIdSnapshots ??= new Dictionary<int, ulong>();
-        LogSchemaOffsetOnce();
+        _timeoutTimer?.Kill();
+        _timeoutTimer = null;
+        _activeVote = null;
 
-        foreach (var entry in _managedBotIncarnations)
+        var controller = FindVoteController();
+        vote.Finish(outcome, controller);
+
+        if (outcome != HumanVoteOutcome.Passed)
         {
-            var slot = entry.Key;
-            var incarnation = entry.Value;
-            if (_botIdentityApi?.IsManagedBotIncarnation(slot, incarnation) != true)
-                continue;
-
-            var player = Utilities.GetPlayerFromSlot(slot);
-            if (player == null || !player.IsValid)
-                continue;
-
-            if (!_schemaSteamIdSnapshots.ContainsKey(slot))
-            {
-                var schemaSid = player.SteamID;
-                var restoreSid = schemaSid != 0
-                    ? schemaSid
-                    : _botIdentityApi?.GetBotSteamId(slot) ?? 0UL;
-                _schemaSteamIdSnapshots[slot] = restoreSid;
-                Logger.LogInformation(
-                    "[VoteFix] schema steamid snapshot slot={Slot} handle=0x{Handle:X} steamid={Sid} restore={Restore} netid={NetId}",
-                    slot, (long)player.Handle, schemaSid, restoreSid, player.NetworkIDString ?? "");
-            }
-
-            try
-            {
-                Schema.SetSchemaValue(player.Handle, "CBasePlayerController", "m_steamID", 0UL);
-            }
-            catch (Exception exception)
-            {
-                Logger.LogError(exception, "[VoteFix] schema steamid zero failed slot={Slot}", slot);
-            }
+            if (outcome != HumanVoteOutcome.Cancelled)
+                _issueCooldownUntil[vote.Request.CooldownKey] = Server.CurrentTime + FailureCooldown();
+            return;
         }
+
+        string commandText = vote.Request.BuildCommand();
+        if (string.IsNullOrWhiteSpace(commandText)) return;
+
+        _executeTimer?.Kill();
+        _executeTimer = AddTimer(Config.ExecuteDelaySeconds, () =>
+        {
+            _executeTimer = null;
+            Logger.LogInformation("[VoteFix] executing '{Command}' for passed {Issue} vote", commandText, vote.Request.IssueType);
+            Server.ExecuteCommand(commandText);
+        });
     }
 
-    private void RestoreManagedSteamIds()
+    private void CancelActiveVote(string reason)
     {
-        if (_schemaSteamIdSnapshots == null)
-            return;
+        _timeoutTimer?.Kill();
+        _timeoutTimer = null;
+        _executeTimer?.Kill();
+        _executeTimer = null;
 
-        foreach (var entry in _schemaSteamIdSnapshots)
-        {
-            var slot = entry.Key;
-            var steamId = entry.Value;
-            if (_managedBotIncarnations != null &&
-                _managedBotIncarnations.TryGetValue(slot, out var incarnation) &&
-                _botIdentityApi?.IsManagedBotIncarnation(slot, incarnation) != true)
-            {
-                continue;
-            }
-
-            var player = Utilities.GetPlayerFromSlot(slot);
-            if (player == null || !player.IsValid)
-                continue;
-
-            try
-            {
-                Schema.SetSchemaValue(player.Handle, "CBasePlayerController", "m_steamID", steamId);
-            }
-            catch (Exception exception)
-            {
-                Logger.LogError(exception, "[VoteFix] schema steamid restore failed slot={Slot}", slot);
-            }
-        }
-
-        _schemaSteamIdSnapshots = null;
+        var vote = _activeVote;
+        if (vote == null) return;
+        _activeVote = null;
+        Logger.LogInformation("[VoteFix] cancelling active vote: {Reason}", reason);
+        try { vote.Finish(HumanVoteOutcome.Cancelled, FindVoteController()); }
+        catch (Exception exception) { Logger.LogWarning(exception, "[VoteFix] cancel failed"); }
     }
 
-    private void LogSchemaOffsetOnce()
+    // ---------------------------------------------------------------------
+    // helpers
+    // ---------------------------------------------------------------------
+
+    private static CVoteController? FindVoteController()
     {
-        if (_schemaOffsetLogged)
-            return;
-        _schemaOffsetLogged = true;
-        try
-        {
-            var offset = Schema.GetSchemaOffset("CBasePlayerController", "m_steamID");
-            Logger.LogInformation("[VoteFix] schema m_steamID offset={Offset}", offset);
-        }
-        catch (Exception exception)
-        {
-            Logger.LogError(exception, "[VoteFix] Schema.GetSchemaOffset m_steamID failed");
-        }
-    }
-
-    private void RefreshVote()
-    {
-        if (!Config.Enabled || !_voteActive)
-            return;
-
-        CaptureAndZeroManagedSteamIds();
-
-        var controller = Utilities
+        return Utilities
             .FindAllEntitiesByDesignerName<CVoteController>("vote_controller")
-            .LastOrDefault(entity => entity.IsValid && entity.ActiveIssueIndex >= 0);
+            .FirstOrDefault(controller => controller.IsValid);
+    }
 
-        if (controller == null)
-        {
-            // Vote controller vanished (vote ended or started but never completed).
-            // Stop refreshing to avoid spamming the log.
-            StopRefreshing();
-            Logger.LogInformation("[VoteFix] RefreshVote: controller vanished, stopping refresh loop");
-            return;
-        }
+    private float VoteDuration()
+    {
+        if (Config.VoteDurationSeconds > 0f) return Config.VoteDurationSeconds;
+        return ReadFloat("sv_vote_timer_duration", DefaultVoteDuration, 1f, 300f);
+    }
 
-        var maxSlots = controller.VotesCast.Length;
-        var allPlayers = Utilities.GetPlayers().Where(p => p.IsValid).ToList();
+    private float QuorumRatio()
+    {
+        if (Config.QuorumRatio > 0f) return Math.Clamp(Config.QuorumRatio, 0.01f, 1f);
+        return ReadFloat("sv_vote_quorum_ratio", DefaultQuorumRatio, 0.01f, 1f);
+    }
 
-        var eligibleSlots = allPlayers
-            .Where(player => IsEligibleVoter(player, _botIdentityApi, _managedBotIncarnations))
-            .Select(player => player.Slot)
-            .Where(slot => slot >= 0 && slot < maxSlots)
-            .ToHashSet();
+    private float FailureCooldown()
+    {
+        if (Config.FailureCooldownSeconds >= 0f) return Config.FailureCooldownSeconds;
+        return ReadFloat("sv_vote_failure_timer", DefaultFailureCooldown, 0f, 3600f);
+    }
 
-        var potentialVotes = Math.Max(eligibleSlots.Count, Config.MinimumPotentialVotes);
-        var optionCounts = new int[5];
-        var votesCastChanged = false;
+    private float CallerCooldown()
+    {
+        if (Config.CallerCooldownSeconds >= 0f) return Config.CallerCooldownSeconds;
+        return ReadFloat("sv_vote_creation_timer", DefaultCallerCooldown, 0f, 3600f);
+    }
 
-        for (var slot = 0; slot < maxSlots; slot++)
-        {
-            var cast = controller.VotesCast[slot];
-            if (!eligibleSlots.Contains(slot))
-            {
-                if (cast != UncastVote)
-                {
-                    controller.VotesCast[slot] = UncastVote;
-                    votesCastChanged = true;
-                }
-                continue;
-            }
-
-            if (cast is >= 0 and < 5)
-                optionCounts[cast]++;
-            else if (cast != UncastVote)
-            {
-                controller.VotesCast[slot] = UncastVote;
-                votesCastChanged = true;
-            }
-        }
-
-        var changed = controller.PotentialVotes != potentialVotes;
-        var oldPotential = controller.PotentialVotes;
-        controller.PotentialVotes = potentialVotes;
-
-        for (var option = 0; option < optionCounts.Length; option++)
-        {
-            changed |= controller.VoteOptionCount[option] != optionCounts[option];
-            controller.VoteOptionCount[option] = optionCounts[option];
-        }
-
-        if (changed)
-        {
-            Utilities.SetStateChanged(controller, "CVoteController", "m_nPotentialVotes");
-            Utilities.SetStateChanged(controller, "CVoteController", "m_nVoteOptionCount");
-            Logger.LogInformation("[VoteFix] SetStateChanged: potential {Old} -> {New}, eligible {Eligible}/{Total} (threshold @ {Ratio:P0})",
-                oldPotential, potentialVotes, eligibleSlots.Count, allPlayers.Count, 0.501);
-        }
-
-        if (votesCastChanged)
-            Utilities.SetStateChanged(controller, "CVoteController", "m_nVotesCast");
-
-        if (!changed && !votesCastChanged && _lastPotentialVotes == potentialVotes)
-            return;
-
-        var eligibleChanged = eligibleSlots.Count != _lastEligibleCount || allPlayers.Count != _lastEligibleTotal;
-        _lastEligibleCount = eligibleSlots.Count;
-        _lastEligibleTotal = allPlayers.Count;
-        if (eligibleChanged)
-        {
-            Logger.LogInformation("[VoteFix] Eligible voters: {Count}/{Total}",
-                eligibleSlots.Count, allPlayers.Count);
-        }
-
-        _lastPotentialVotes = potentialVotes;
-        Array.Copy(optionCounts, _lastOptionCounts, optionCounts.Length);
-
+    private float ReadFloat(string name, float fallback, float min, float max)
+    {
+        var cvar = ConVar.Find(name);
+        if (cvar == null) return fallback;
         try
         {
-            var changedEvent = new EventVoteChanged(false)
+            float value = cvar.Type switch
             {
-                Potentialvotes = potentialVotes,
-                VoteOption1 = optionCounts[0],
-                VoteOption2 = optionCounts[1],
-                VoteOption3 = optionCounts[2],
-                VoteOption4 = optionCounts[3],
-                VoteOption5 = optionCounts[4],
-                Yesvotes = optionCounts[0],
-                Novotes = optionCounts[1],
+                ConVarType.Float32 => cvar.GetPrimitiveValue<float>(),
+                ConVarType.Float64 => (float)cvar.GetPrimitiveValue<double>(),
+                ConVarType.Int32 => cvar.GetPrimitiveValue<int>(),
+                ConVarType.Int16 => cvar.GetPrimitiveValue<short>(),
+                ConVarType.Int64 => cvar.GetPrimitiveValue<long>(),
+                ConVarType.UInt32 => cvar.GetPrimitiveValue<uint>(),
+                _ => fallback,
             };
-            changedEvent.FireEvent(false);
+            return Math.Clamp(value, min, max);
         }
         catch (Exception exception)
         {
-            // FireEvent can throw NativeException("Invalid game event") when
-            // the engine has no live vote event to clone (observed when the
-            // vote had zero eligible voters). The controller writes above are
-            // already applied; skip the client-side broadcast only.
-            Logger.LogDebug(exception, "[VoteFix] vote_changed broadcast skipped");
+            Logger.LogDebug(exception, "[VoteFix] failed to read {ConVar}", name);
+            return fallback;
         }
-
-        Logger.LogDebug("Native vote quorum updated: potential={Potential}, yes={Yes}, no={No}",
-            potentialVotes, optionCounts[0], optionCounts[1]);
-    }
-
-    // Voter eligibility:
-    //   1. The slot is not in the managed-bot snapshot (or the API is
-    //      unavailable, in which case the snapshot is empty).
-    //   2. If the slot was in the snapshot, its current incarnation
-    //      matches the snapshot's incarnation. A slot that was a managed
-    //      bot at vote start but now has a different incarnation has been
-    //      re-used by something else — count it as eligible.
-    //   3. The engine's IsBot flag is false. In player mode, the native
-    //      plugin overwrites m_bFakePlayer to 0, but the controller's
-    //      IsBot check may still rely on the original bit. The
-    //      botidentity:api check above is the authoritative source;
-    //      the IsBot fallback catches un-managed native bots.
-    private static bool IsEligibleVoter(CCSPlayerController player, IBotIdentityApi? botIdentityApi, Dictionary<int, ulong>? managedBotCache)
-    {
-        if (!player.IsValid || player.IsHLTV)
-            return false;
-
-        if (managedBotCache != null && managedBotCache.TryGetValue(player.Slot, out ulong incarnation))
-        {
-            if (botIdentityApi?.IsManagedBotIncarnation(player.Slot, incarnation) == true)
-                return false;
-        }
-
-        if (botIdentityApi?.IsManagedBot(player.Slot) == true)
-            return false;
-
-        return !player.IsBot;
     }
 }

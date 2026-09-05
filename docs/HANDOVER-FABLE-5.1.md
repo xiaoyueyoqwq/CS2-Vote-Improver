@@ -11,6 +11,27 @@
 
 ---
 
+## 0. fable-5.1 进展（2026-09-05，未上线）
+
+按第 9 节方向 3 做了产品分叉：**BotVoteFix 2.0.0 不再修 Valve 的分母，而是接管白名单 `callvote`，自建只含真人的投票池**。代码在本仓库 `fable-5.1` 分支，只完成了 `dotnet build -c Release`，**没有在线上或本地 CS2 服务器验证**。
+
+做法（见 `README.md`）：
+
+- `AddCommandListener("callvote", Pre)`：白名单 issue（默认 `ChangeLevel` / `Kick` / `RestartGame` / `StartTimeOut`）返回 `Handled`，不让 Valve 建 issue；其他 issue、BOT 发起、踢 BOT、`IsMapValid=false`、`sv_vote_issue_*_allowed=0`、已有原生投票时 `Continue` 放行。
+- 投票池：`Connected && !IsHLTV && !IsBot && !botidentity:api.IsManagedBot(slot)`，队内 issue 再按队过滤。
+- HUD：`VoteStart`(346) UserMessage 只发给投票池；`CVoteController.m_iActiveIssueIndex=2` 让引擎继续对 `vote option1/2` 发 `vote_cast`（CS2Fixes PanoramaVote 同款做法）；计票写 `m_nVoteOptionCount` + `vote_changed` 仅用于显示。
+- 门槛 `ceil(potential * sv_vote_quorum_ratio)`，时长 `sv_vote_timer_duration`，失败冷却 `sv_vote_failure_timer`，发起人冷却 `sv_vote_creation_timer`。
+- 通过 → `VotePass`(347) + 延迟执行 `changelevel {map}` / `kickid {userid}` / `mp_restartgame 1` / `timeout_{team_name}_start`；失败 → `VoteFailed`(348)。
+- 已删除 1.1.2 的 Schema `m_steamID` 清零、`RefreshVote` 定时器、原生投票追踪。BotIdentity 的 `vote_transaction` 未动。
+
+上线前要人工确认的点：
+
+1. CS2 客户端 `callvote Kick` 的实参形状（`Kick <userid> [reason]` 还是 `Kick "<userid> <reason>"`），两种都已兼容，但没实测。
+2. `m_iActiveIssueIndex=2` 且不启动 `m_acceptingVotesTimer` 时引擎不会自行结算——这是 CS2Fixes 长期依赖的行为，但与 CS2 构建绑定。
+3. 验收标准改为：换图，1 真人 yes，日志 `vote start ... potential=1 required=1` → `vote end ... outcome=Passed` → `executing 'changelevel ...'`。第 11 节「Valve 自己写的 potential 必须是 1」对 2.0 不再适用，因为 Valve 根本不再建 issue。
+
+---
+
 ## 1. 问题
 
 目标：CS2 原生投票（`callvote` / Panorama 投票 UI）的法定人数只算真人，不算托管 BOT。

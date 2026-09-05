@@ -1,18 +1,52 @@
 # CS2 Vote Improver
 
-CounterStrikeSharp plugin that removes bots from the eligible-voter count of
-native CS2 votes. It keeps the native Panorama vote UI and listens to the
-native vote lifecycle.
+CounterStrikeSharp plugin that makes whitelisted `callvote` issues count only
+humans. It keeps the native Panorama vote HUD, but the electorate and the
+tally are owned by the plugin instead of Valve's `CVoteController`.
+
+## Why the plugin takes over `callvote`
+
+Valve's vote quorum counts every connected player controller, including bots
+that `CS2-Bot-Identity` runs in *player* mode. Versions 1.x tried to shrink
+that denominator by rewriting identity fields (`m_bFakePlayer`, `FL_FAKECLIENT`,
+SteamID mirrors, `CBasePlayerController::m_steamID`, `GetClientXUID`,
+`m_nPotentialVotes`, ...). None of it changed Valve's internal count: a live
+`changelevel` vote with 1 human still logged `potential=10` and timed out.
+See `docs/HANDOVER-FABLE-5.1.md` §7 for the full list of falsified routes.
+
+Version 2.0 stops fighting the native issue. For a whitelisted issue the plugin:
+
+1. intercepts `callvote <Issue> [details]` in a `Pre` command listener and
+   returns `Handled`, so no native issue is created;
+2. builds the electorate from connected controllers that are not HLTV, not
+   engine bots, and not `botidentity:api.IsManagedBot(slot)` (team issues
+   filter by the caller's team);
+3. shows the native HUD to those players with the `VoteStart` user message,
+   and sets `CVoteController.m_iActiveIssueIndex` to a non-negative index so
+   the server keeps firing `vote_cast` for `vote option1/option2`
+   (the same technique CS2Fixes' PanoramaVote uses);
+4. tallies only ballots from the electorate, publishes counts through
+   `CVoteController.m_nVoteOptionCount` / `vote_changed`, and decides with
+   `ceil(potential * sv_vote_quorum_ratio)` yes votes;
+5. sends `VotePass` and runs the issue's command (`changelevel <map>`,
+   `kickid <userid>`, `mp_restartgame 1`, `timeout_<team>_start`, ...), or
+   sends `VoteFailed` and starts the issue cooldown.
+
+Anything not whitelisted (Surrender, unknown issues, votes called by bots,
+kick votes against bots, maps that fail `IsMapValid`, disabled
+`sv_vote_issue_*_allowed` ConVars, an already running native vote) is passed
+through untouched to the native handler.
 
 ## Requirements
 
 - CounterStrikeSharp API 1.0.371 or a compatible release targeting `net10.0`
-- `CS2-Bot-Identity` (native plugin) installed and loaded
+- `CS2-Bot-Identity` (native plugin + `BotIdentityImpl`) installed and loaded
 - `BotIdentityApi` shared assembly provided by `CS2-Bot-Identity`
 
-The plugin reads managed-bot metadata from the `botidentity:api`
-capability published by `CS2-Bot-Identity` (via the `/dev/shm/CS2BotHider_Slots`
-shared region the native plugin writes).
+The plugin reads managed-bot metadata from the `botidentity:api` capability.
+Without it, only the engine's `IsBot` flag is available and player-mode bots
+will be counted as humans (set `AllowWithoutBotIdentityApi=false` to fall back
+to native voting instead).
 
 Build with:
 
@@ -26,71 +60,63 @@ Copy `bin/Release/net10.0/BotVoteFix.dll` to:
 The DLL must be directly inside that directory, not in a nested
 `BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
 with `css_plugins list` and look for the startup line containing
-`Bot Vote Fix v1.1.2`.
+`Bot Vote Fix v2.0.0`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.
 
 ## Configuration
 
-- `Enabled`: enable the plugin.
-- `RefreshIntervalSeconds`: how often the active vote controller is reconciled
-  (0.05-1.0 seconds).
-- `MinimumPotentialVotes`: lower bound for `m_nPotentialVotes`; keep this at 1
-  to prevent a zero-player vote from being treated as an immediate pass.
+- `Enabled`: enable the takeover. When false every `callvote` is native.
+- `VoteDurationSeconds`: overrides `sv_vote_timer_duration` when > 0.
+- `QuorumRatio`: overrides `sv_vote_quorum_ratio` when > 0.
+- `FailureCooldownSeconds`: overrides `sv_vote_failure_timer` when >= 0.
+- `CallerCooldownSeconds`: overrides `sv_vote_creation_timer` when >= 0.
+- `ExecuteDelaySeconds`: delay between `VotePass` and running the command.
+- `AllowWithoutBotIdentityApi`: see above.
+- `Issues`: per-issue settings keyed by the `callvote` issue name
+  (`ChangeLevel`, `Kick`, `RestartGame`, `StartTimeOut`, `NextLevel`,
+  `ScrambleTeams`, `SwapTeams`, `Surrender`):
+  - `Enabled`: take this issue over (defaults: ChangeLevel, Kick,
+    RestartGame, StartTimeOut on; the rest off).
+  - `Scope`: `Global` or `Team`.
+  - `DisplayString` / `PassedString`: Panorama localisation tokens.
+  - `Command`: server command run on pass. Placeholders: `{map}`,
+    `{details}`, `{userid}`, `{team}`, `{team_name}`. Empty = never take over.
+  - `AllowConVar`: boolean ConVar that must be enabled.
+  - `FailedRecentlyReason`: `CallVoteFailed.reason` used while on cooldown.
 
-The voter pool excludes invalid clients, HLTV, native bots, and any slot where
-`botidentity:api` reports `IsManagedBot(slot) == true`.
+Issues missing from an existing config file are added disabled.
 
-Vote tracking is armed from `vote_options` as well as `vote_started`; the former
-is emitted earlier in the native vote creation path. The first reconciliation is
-performed synchronously and subsequent passes run on the configured timer. The
-plugin logs `[VoteFix] Native vote tracking armed by ...` when this path is active.
+## Behaviour details
 
-On `vote_options`, and again on every refresh tick, the plugin writes
-`CBasePlayerController::m_steamID = 0` through CSS Schema for each managed
-bot still matching the vote-start incarnation. That write does **not** call
-`SetStateChanged`, so the scoreboard should not flash an empty SteamID.
-BotHiderImpl's 0.25s/2s reconcile can put the synthetic SteamID back; the
-refresh loop covers it. The snapshotted SteamID is restored when the vote
-ends (including timeout / vanished controller). `CVoteController` field
-rewrites remain HUD/log probes only — they do not change Valve's internal
-quorum. Pair this with BotIdentity 0.1.3; a global `changelevel` vote is
-the test that matters, not a team timeout with one human and one teammate
-bot. Live 0.1.3/1.1.2 still timed out a changelevel with Valve
-`potential=10` while schema SteamID and engine XUID were 0. Stop
-zeroing identity fields. Handover brief: `docs/HANDOVER-FABLE-5.1.md`.
-
-### Bot-Identity compatibility
-
-This plugin uses the `botidentity:api` capability exclusively and does not
-depend on the legacy `bothider:api`. The voter pool is recomputed against
-the snapshot the native plugin published at vote start, then re-validated
-each tick against the current `Incarnation` value — a slot that was a
-managed bot at vote start but has since been re-used is correctly reclassified
-as eligible. If the native plugin is not loaded, the plugin falls back to
-the engine's `IsBot` flag and logs a warning at startup.
+- Rejections (`CallVoteFailed`) use the CS:GO `vote_create_failed_t` codes:
+  spectator caller, caller rate limit, issue cooldown, unknown kick target.
+- A voter who disconnects mid-vote shrinks the electorate; a kick target who
+  disconnects cancels the vote without starting the cooldown.
+- The vote ends early once the outcome cannot change (enough yes votes, or
+  not enough voters left to reach quorum).
+- `callvote Kick` accepts both `Kick <userid> [reason]` and the quoted
+  `Kick "<userid> <reason>"` form; the reason picks the matching
+  `#SFUI_vote_kick_player_*` token.
+- Managed bots in *bot* mode are also excluded (they are `IsBot`); the
+  legacy BotHider auto-yes only fires on `vote_options`, which the takeover
+  never emits, and its synthetic `vote_cast` events are filtered by slot.
 
 ## Scope and limitations
 
-This changes the native controller's potential-vote denominator and removes
-non-human cast entries while a vote is active. It does not make bots cast a
-choice and it does not replace the server's vote policy (`sv_vote_quorum_ratio`,
-issue permissions, or vote-specific rules).
-
-If no `[VoteFix] Bot Vote Fix loaded` or `Native vote tracking armed` message is
-present after loading the DLL, the server is running a different plugin copy or
-the plugin did not load; native vote behavior cannot be diagnosed from the HUD
-alone. A live test must also confirm the first `Eligible voters` count in the
-server log, using the exact CounterStrikeSharp and CS2 builds in production.
-
-The plugin must be tested against the exact CS2 build and other vote plugins
-running on the server. Plugins that overwrite `CVoteController` every frame,
-or that start their own custom menu votes, may need an integration setting or
-should be disabled for the affected vote.
-
-No dedicated public plugin was found that specifically fixes native vote
-quorum for regular bots or BotHider. Existing projects such as
-[NativeVoteAPI-CS2](https://github.com/fltuna/NativeVoteAPI-CS2) provide an API
-for creating replacement native votes, while map-vote plugins generally manage
-their own vote pool.
+- Only whitelisted issues get a human-only quorum; native votes started by
+  other paths (e.g. Surrender, other plugins' issues) keep Valve's count.
+- The `callvote` argument format was taken from the CS:GO SDK
+  (`callvote ChangeLevel <map>`, `callvote Kick "<userid> <reason>"`,
+  `callvote StartTimeOut`). Verify on the live CS2 build; unknown shapes fall
+  back to the native handler or a `CallVoteFailed` reply, never a wrong
+  command.
+- Writing `m_iActiveIssueIndex` while no native issue exists relies on the
+  engine not starting `m_acceptingVotesTimer`; this is build-sensitive
+  (see `AGENTS.md`) and must be re-checked after CS2 updates together with
+  any other plugin that touches `CVoteController`.
+- This build has **not** been validated on a live server. The acceptance
+  test is a `changelevel` vote with 1 human and player-mode bots: the log
+  must show `vote start ... potential=1 required=1`, then
+  `vote end ... outcome=Passed` and `executing 'changelevel ...'`.
