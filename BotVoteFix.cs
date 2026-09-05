@@ -5,6 +5,7 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Core.Capabilities;
 using CounterStrikeSharp.API.Modules.Events;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Timers;
 using Microsoft.Extensions.Logging;
 using CssTimer = CounterStrikeSharp.API.Modules.Timers.Timer;
@@ -44,9 +45,11 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     /// include a fresh human voter.
     /// </summary>
     private Dictionary<int, ulong>? _managedBotIncarnations;
+    private Dictionary<int, ulong>? _schemaSteamIdSnapshots;
+    private bool _schemaOffsetLogged;
 
     public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "1.1.1";
+    public override string ModuleVersion => "1.1.2";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Excludes managed bots (via the botidentity:api capability) from native vote quorum.";
@@ -186,6 +189,9 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         _refreshTimer = AddTimer(Config.RefreshIntervalSeconds, RefreshVote, TimerFlags.REPEAT);
         Logger.LogInformation("[VoteFix] Starting refresh timer with interval {Interval}s", Config.RefreshIntervalSeconds);
 
+        // Zero schema SteamID on this call stack, before vote_options returns
+        // and Valve's first Think writes potential. Do not wait for NextFrame.
+        CaptureAndZeroManagedSteamIds();
         AddTimer(0.0f, RefreshVote);
     }
 
@@ -198,6 +204,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
     private void StopRefreshing()
     {
+        RestoreManagedSteamIds();
         _voteActive = false;
         _refreshTimer?.Kill();
         _refreshTimer = null;
@@ -209,10 +216,103 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         _voteArmLogged = false;
     }
 
+    private void CaptureAndZeroManagedSteamIds()
+    {
+        if (_managedBotIncarnations == null || _managedBotIncarnations.Count == 0)
+            return;
+
+        _schemaSteamIdSnapshots ??= new Dictionary<int, ulong>();
+        LogSchemaOffsetOnce();
+
+        foreach (var entry in _managedBotIncarnations)
+        {
+            var slot = entry.Key;
+            var incarnation = entry.Value;
+            if (_botIdentityApi?.IsManagedBotIncarnation(slot, incarnation) != true)
+                continue;
+
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player == null || !player.IsValid)
+                continue;
+
+            if (!_schemaSteamIdSnapshots.ContainsKey(slot))
+            {
+                var schemaSid = player.SteamID;
+                var restoreSid = schemaSid != 0
+                    ? schemaSid
+                    : _botIdentityApi?.GetBotSteamId(slot) ?? 0UL;
+                _schemaSteamIdSnapshots[slot] = restoreSid;
+                Logger.LogInformation(
+                    "[VoteFix] schema steamid snapshot slot={Slot} handle=0x{Handle:X} steamid={Sid} restore={Restore} netid={NetId}",
+                    slot, (long)player.Handle, schemaSid, restoreSid, player.NetworkIDString ?? "");
+            }
+
+            try
+            {
+                Schema.SetSchemaValue(player.Handle, "CBasePlayerController", "m_steamID", 0UL);
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError(exception, "[VoteFix] schema steamid zero failed slot={Slot}", slot);
+            }
+        }
+    }
+
+    private void RestoreManagedSteamIds()
+    {
+        if (_schemaSteamIdSnapshots == null)
+            return;
+
+        foreach (var entry in _schemaSteamIdSnapshots)
+        {
+            var slot = entry.Key;
+            var steamId = entry.Value;
+            if (_managedBotIncarnations != null &&
+                _managedBotIncarnations.TryGetValue(slot, out var incarnation) &&
+                _botIdentityApi?.IsManagedBotIncarnation(slot, incarnation) != true)
+            {
+                continue;
+            }
+
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player == null || !player.IsValid)
+                continue;
+
+            try
+            {
+                Schema.SetSchemaValue(player.Handle, "CBasePlayerController", "m_steamID", steamId);
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError(exception, "[VoteFix] schema steamid restore failed slot={Slot}", slot);
+            }
+        }
+
+        _schemaSteamIdSnapshots = null;
+    }
+
+    private void LogSchemaOffsetOnce()
+    {
+        if (_schemaOffsetLogged)
+            return;
+        _schemaOffsetLogged = true;
+        try
+        {
+            var offset = Schema.GetSchemaOffset("CBasePlayerController", "m_steamID");
+            Logger.LogInformation("[VoteFix] schema m_steamID offset={Offset}", offset);
+        }
+        catch (Exception exception)
+        {
+            Logger.LogError(exception, "[VoteFix] Schema.GetSchemaOffset m_steamID failed");
+        }
+    }
+
     private void RefreshVote()
     {
         if (!Config.Enabled || !_voteActive)
             return;
+
+        CaptureAndZeroManagedSteamIds();
 
         var controller = Utilities
             .FindAllEntitiesByDesignerName<CVoteController>("vote_controller")

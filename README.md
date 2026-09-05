@@ -26,7 +26,7 @@ Copy `bin/Release/net10.0/BotVoteFix.dll` to:
 The DLL must be directly inside that directory, not in a nested
 `BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
 with `css_plugins list` and look for the startup line containing
-`Bot Vote Fix v1.1.0`.
+`Bot Vote Fix v1.1.2`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.
@@ -46,6 +46,20 @@ Vote tracking is armed from `vote_options` as well as `vote_started`; the former
 is emitted earlier in the native vote creation path. The first reconciliation is
 performed synchronously and subsequent passes run on the configured timer. The
 plugin logs `[VoteFix] Native vote tracking armed by ...` when this path is active.
+
+On `vote_options`, and again on every refresh tick, the plugin writes
+`CBasePlayerController::m_steamID = 0` through CSS Schema for each managed
+bot still matching the vote-start incarnation. That write does **not** call
+`SetStateChanged`, so the scoreboard should not flash an empty SteamID.
+BotHiderImpl's 0.25s/2s reconcile can put the synthetic SteamID back; the
+refresh loop covers it. The snapshotted SteamID is restored when the vote
+ends (including timeout / vanished controller). `CVoteController` field
+rewrites remain HUD/log probes only — they do not change Valve's internal
+quorum. Pair this with BotIdentity 0.1.3; a global `changelevel` vote is
+the test that matters, not a team timeout with one human and one teammate
+bot. Live 0.1.3/1.1.2 still timed out a changelevel with Valve
+`potential=10` while schema SteamID and engine XUID were 0. Stop
+zeroing identity fields. Handover brief: `docs/HANDOVER-FABLE-5.1.md`.
 
 ### Bot-Identity compatibility
 
