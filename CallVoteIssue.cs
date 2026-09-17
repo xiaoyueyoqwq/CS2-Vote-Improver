@@ -1,7 +1,7 @@
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API.Modules.Utils;
 
-namespace BotVoteFix;
+namespace VoteImprover;
 
 public enum VoteScope
 {

@@ -53,22 +53,64 @@ Without it, only the engine's `IsBot` flag is available and player-mode bots
 will be counted as humans (set `AllowWithoutBotIdentityApi=false` to fall back
 to native voting instead).
 
+Version 2.1.0 also registers `voteimprover:api` so other plugins can start a
+server-initiated yes/no vote. The electorate is the same humans-only pool
+as `callvote` (HLTV, engine bots, and `botidentity:api` managed bots are
+excluded). Deploy `VoteImproverApi.dll` next to `VoteImprover.dll`. Consumers
+reference that assembly with `Private=false` and must not copy a second
+DLL into their own plugin folder.
+
+```csharp
+var api = new PluginCapability<IHumanVoteApi>("voteimprover:api").Get();
+api.TryStartVote(new HumanVoteRequest
+{
+    IssueType = "Overtime",
+    DisplayString = "#SFUI_vote",
+    PassedString = "#SFUI_vote_passed",
+    DetailsForUi = "是否进入加时赛？",
+}, outcome => { /* Passed / FailedQuorum / FailedYesMustExceedNo / Cancelled */ });
+```
+
+An empty command is implied: a passed programmatic vote does not run
+`ExecutePassedCommand`. `TryStartVote` returns false when the plugin is
+disabled, a vote is already running, or there are no human voters.
+
+## Install
+
 Build with:
 
 ```bash
 dotnet build -c Release
 ```
 
-Copy `bin/Release/net10.0/BotVoteFix.dll` to:
-`game/csgo/addons/counterstrikesharp/plugins/BotVoteFix/`.
+Copy `bin/Release/net10.0/VoteImprover.dll` and `VoteImproverApi.dll` to:
+`game/csgo/addons/counterstrikesharp/plugins/VoteImprover/`.
 
-The DLL must be directly inside that directory, not in a nested
-`BotVoteFix/BotVoteFix/` directory. After a hot reload, verify the active copy
-with `css_plugins list` and look for the startup line containing
-`Bot Vote Fix v2.0.2`.
+The DLLs must sit directly in that directory, not in a nested
+`VoteImprover/VoteImprover/` folder. Do not leave the old
+`plugins/BotVoteFix/` copy loaded at the same time; both would listen to
+`callvote` / `vote`. After a hot reload, `css_plugins list` should show
+`Vote Improver (2.1.0)`, and the log should contain `Vote Improver v2.1.0`.
 
 The generated configuration is in:
-`addons/counterstrikesharp/configs/plugins/BotVoteFix/BotVoteFix.json`.
+`addons/counterstrikesharp/configs/plugins/VoteImprover/VoteImprover.json`.
+
+### Client binds
+
+The plugin counts the client command `vote option1` (yes) and
+`vote option2` (no). If F1/F2 are bound to something else, the HUD appears
+but the ballot never arrives. Players should run this in the CS2 console
+(or put it in autoexec):
+
+```
+bind F1 "vote option1"
+bind F2 "vote option2"
+```
+
+Source bind syntax is `bind <key> "<command>"`. `bind voteoption1 F1` is
+the arguments reversed, and there is no `voteoption1` command. To test
+without a keybind, type `vote option1` or `vote option2` in the console
+while a vote is open.
 
 ## Configuration
 

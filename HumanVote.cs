@@ -1,17 +1,10 @@
+using VoteImproverApi;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Modules.UserMessages;
 using CounterStrikeSharp.API.Modules.Utils;
 
-namespace BotVoteFix;
-
-public enum HumanVoteOutcome
-{
-    Passed,
-    FailedQuorum,
-    FailedYesMustExceedNo,
-    Cancelled,
-}
+namespace VoteImprover;
 
 /// <summary>
 /// A yes/no vote that is displayed through the native Panorama vote HUD but

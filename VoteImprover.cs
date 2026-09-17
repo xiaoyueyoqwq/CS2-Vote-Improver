@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using BotIdentityApi;
+using VoteImproverApi;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -11,9 +12,9 @@ using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 using CssTimer = CounterStrikeSharp.API.Modules.Timers.Timer;
 
-namespace BotVoteFix;
+namespace VoteImprover;
 
-public sealed class BotVoteFixConfig : BasePluginConfig
+public sealed class VoteImproverConfig : BasePluginConfig
 {
     [JsonPropertyName("Enabled")]
     public bool Enabled { get; set; } = true;
@@ -59,7 +60,7 @@ public sealed class BotVoteFixConfig : BasePluginConfig
 /// issue's command ourselves when it passes.
 /// </summary>
 [MinimumApiVersion(334)]
-public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
+public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>, IHumanVoteApi
 {
     private const float DefaultVoteDuration = 15f;
     private const float DefaultQuorumRatio = 0.501f;
@@ -67,25 +68,27 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     private const float DefaultCallerCooldown = 150f;
 
     private static readonly PluginCapability<IBotIdentityApi> CapabilityToken = new("botidentity:api");
+    public static PluginCapability<IHumanVoteApi> HumanVoteCapability { get; } = new("voteimprover:api");
 
     private IBotIdentityApi? _botIdentityApi;
     private HumanVote? _activeVote;
+    private Action<HumanVoteOutcome>? _onComplete;
     private CssTimer? _timeoutTimer;
     private CssTimer? _executeTimer;
     private readonly Dictionary<string, float> _issueCooldownUntil = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
-    public override string ModuleName => "Bot Vote Fix";
-    public override string ModuleVersion => "2.0.2";
+    public override string ModuleName => "Vote Improver";
+    public override string ModuleVersion => "2.1.0";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
 
-    public BotVoteFixConfig Config { get; set; } = new();
+    public VoteImproverConfig Config { get; set; } = new();
 
     public override void Load(bool hotReload)
     {
-        Logger.LogInformation("[VoteFix] Loading Bot Vote Fix v{Version}. Enabled={Enabled}",
+        Logger.LogInformation("[VoteImprover] Loading Vote Improver v{Version}. Enabled={Enabled}",
             ModuleVersion, Config.Enabled);
 
         AddCommandListener("callvote", OnCallVote, HookMode.Pre);
@@ -93,6 +96,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         RegisterEventHandler<EventVoteCast>(OnVoteCast);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
+        Capabilities.RegisterPluginCapability(HumanVoteCapability, () => this);
 
         if (hotReload)
         {
@@ -103,9 +107,10 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     public override void OnAllPluginsLoaded(bool hotReload)
     {
         _botIdentityApi = ResolveBotIdentityApi();
-        Logger.LogInformation("[VoteFix] botidentity:api {State}; managed bots will {Treatment}.",
+        Logger.LogInformation("[VoteImprover] botidentity:api {State}; managed bots will {Treatment}.",
             _botIdentityApi == null ? "not available" : "available",
             _botIdentityApi == null ? "only be excluded when the engine flags them as bots" : "be excluded explicitly");
+        Logger.LogInformation("[VoteImprover] voteimprover:api registered");
     }
 
     public override void Unload(bool hotReload)
@@ -118,7 +123,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         RemoveListener<Listeners.OnMapEnd>(OnMapEnd);
     }
 
-    public void OnConfigParsed(BotVoteFixConfig config)
+    public void OnConfigParsed(VoteImproverConfig config)
     {
         config.ExecuteDelaySeconds = Math.Clamp(config.ExecuteDelaySeconds, 0f, 30f);
         config.Issues ??= IssueConfig.Defaults();
@@ -155,7 +160,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         }
         catch (Exception exception)
         {
-            Logger.LogError(exception, "[VoteFix] callvote takeover failed; passing '{Args}' to the native handler", command.ArgString);
+            Logger.LogError(exception, "[VoteImprover] callvote takeover failed; passing '{Args}' to the native handler", command.ArgString);
             return HookResult.Continue;
         }
     }
@@ -165,7 +170,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         string issueType = command.GetArg(1).Trim();
         if (!Config.Issues.TryGetValue(issueType, out var issue) || !issue.Enabled || string.IsNullOrWhiteSpace(issue.Command))
         {
-            Logger.LogDebug("[VoteFix] callvote {Issue}: not whitelisted, native handles it", issueType);
+            Logger.LogDebug("[VoteImprover] callvote {Issue}: not whitelisted, native handles it", issueType);
             return HookResult.Continue;
         }
 
@@ -174,7 +179,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
             var allow = ConVar.Find(issue.AllowConVar);
             if (allow != null && !allow.GetPrimitiveValue<bool>())
             {
-                Logger.LogDebug("[VoteFix] callvote {Issue}: {ConVar} is 0, native handles it", issueType, issue.AllowConVar);
+                Logger.LogDebug("[VoteImprover] callvote {Issue}: {ConVar} is 0, native handles it", issueType, issue.AllowConVar);
                 return HookResult.Continue;
             }
         }
@@ -185,14 +190,14 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
         if (_botIdentityApi == null && !Config.AllowWithoutBotIdentityApi)
         {
-            Logger.LogWarning("[VoteFix] callvote {Issue}: botidentity:api unavailable and AllowWithoutBotIdentityApi=false, native handles it", issueType);
+            Logger.LogWarning("[VoteImprover] callvote {Issue}: botidentity:api unavailable and AllowWithoutBotIdentityApi=false, native handles it", issueType);
             return HookResult.Continue;
         }
 
         var controller = FindVoteController();
         if (controller != null && controller.IsValid && controller.ActiveIssueIndex >= 0 && _activeVote == null)
         {
-            Logger.LogDebug("[VoteFix] callvote {Issue}: a native vote is active, native handles it", issueType);
+            Logger.LogDebug("[VoteImprover] callvote {Issue}: a native vote is active, native handles it", issueType);
             return HookResult.Continue;
         }
 
@@ -241,7 +246,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
             if (!Server.IsMapValid(details))
             {
                 // Workshop / unknown names: let the native issue decide instead of guessing.
-                Logger.LogInformation("[VoteFix] callvote {Issue} '{Map}': IsMapValid=false, native handles it", issueType, details);
+                Logger.LogInformation("[VoteImprover] callvote {Issue} '{Map}': IsMapValid=false, native handles it", issueType, details);
                 return HookResult.Continue;
             }
         }
@@ -264,12 +269,12 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         var voters = CollectHumanVoters(request);
         if (voters.Count == 0)
         {
-            Logger.LogWarning("[VoteFix] callvote {Issue}: no human voters found (caller slot {Slot}); native handles it",
+            Logger.LogWarning("[VoteImprover] callvote {Issue}: no human voters found (caller slot {Slot}); native handles it",
                 issueType, caller.Slot);
             return HookResult.Continue;
         }
 
-        StartVote(request, voters, controller);
+        StartVote(request, voters, controller, onComplete: null, durationOverride: 0f);
         if (caller.SteamID != 0)
             _callerCooldownUntil[caller.SteamID] = now + CallerCooldown();
         return HookResult.Handled;
@@ -281,7 +286,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         failed.SetInt("reason", reason);
         failed.SetInt("time", seconds);
         failed.Send(new RecipientFilter(caller));
-        Logger.LogInformation("[VoteFix] callvote rejected for slot {Slot}: reason={Reason} time={Time}",
+        Logger.LogInformation("[VoteImprover] callvote rejected for slot {Slot}: reason={Reason} time={Time}",
             caller.Slot, reason, seconds);
         return HookResult.Handled;
     }
@@ -341,13 +346,69 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
     // vote lifecycle
     // ---------------------------------------------------------------------
 
-    private void StartVote(CallVoteRequest request, List<int> voters, CVoteController? controller)
+    public bool IsVoteActive => _activeVote != null && !_activeVote.IsFinished;
+
+    public bool TryStartVote(HumanVoteRequest request, Action<HumanVoteOutcome> onComplete)
     {
-        var vote = new HumanVote(request, voters, QuorumRatio(), message => Logger.LogInformation("[VoteFix] {Message}", message));
+        if (!Config.Enabled)
+        {
+            Logger.LogWarning("[VoteImprover] TryStartVote refused: plugin disabled");
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(request.IssueType) || onComplete == null)
+            return false;
+
+        if (_activeVote != null)
+        {
+            Logger.LogInformation("[VoteImprover] TryStartVote refused: vote already active issue={Issue}",
+                _activeVote.Request.IssueType);
+            return false;
+        }
+
+        var issue = new IssueConfig
+        {
+            Enabled = true,
+            Scope = VoteScope.Global,
+            DisplayString = string.IsNullOrWhiteSpace(request.DisplayString) ? "#SFUI_vote" : request.DisplayString,
+            PassedString = string.IsNullOrWhiteSpace(request.PassedString) ? "#SFUI_vote_passed" : request.PassedString,
+            Command = "",
+        };
+
+        var callRequest = new CallVoteRequest
+        {
+            IssueType = request.IssueType,
+            Details = request.DetailsForUi,
+            DetailsForUi = request.DetailsForUi,
+            Issue = issue,
+            CallerSlot = -1,
+            CallerTeam = CsTeam.None,
+        };
+
+        var voters = CollectHumanVoters(callRequest);
+        if (voters.Count == 0)
+        {
+            Logger.LogWarning("[VoteImprover] TryStartVote {Issue}: no human voters", request.IssueType);
+            return false;
+        }
+
+        StartVote(callRequest, voters, FindVoteController(), onComplete, request.DurationSeconds);
+        return true;
+    }
+
+    private void StartVote(
+        CallVoteRequest request,
+        List<int> voters,
+        CVoteController? controller,
+        Action<HumanVoteOutcome>? onComplete,
+        float durationOverride)
+    {
+        var vote = new HumanVote(request, voters, QuorumRatio(), message => Logger.LogInformation("[VoteImprover] {Message}", message));
         _activeVote = vote;
+        _onComplete = onComplete;
         vote.Start(controller);
 
-        float duration = VoteDuration();
+        float duration = durationOverride > 0f ? durationOverride : VoteDuration();
         _timeoutTimer?.Kill();
         _timeoutTimer = AddTimer(duration, () =>
         {
@@ -372,7 +433,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         }
         catch (Exception exception)
         {
-            Logger.LogError(exception, "[VoteFix] vote command tally failed for '{Args}'", command.ArgString);
+            Logger.LogError(exception, "[VoteImprover] vote command tally failed for '{Args}'", command.ArgString);
         }
 
         return HookResult.Handled;
@@ -429,7 +490,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
 
         if (vote.Request.TargetSlot >= 0 && vote.Request.TargetSlot == player.Slot)
         {
-            Logger.LogInformation("[VoteFix] kick target left during vote; cancelling");
+            Logger.LogInformation("[VoteImprover] kick target left during vote; cancelling");
             Conclude(vote, HumanVoteOutcome.Cancelled);
             return HookResult.Continue;
         }
@@ -457,8 +518,21 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         _timeoutTimer = null;
         _activeVote = null;
 
+        var callback = _onComplete;
+        _onComplete = null;
+
         var controller = FindVoteController();
         vote.Finish(outcome, controller);
+
+        if (callback != null)
+        {
+            try { callback(outcome); }
+            catch (Exception exception)
+            {
+                Logger.LogError(exception, "[VoteImprover] programmatic vote callback failed");
+            }
+            return;
+        }
 
         if (outcome != HumanVoteOutcome.Passed)
         {
@@ -486,20 +560,20 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
             if (alias != null)
             {
                 Logger.LogInformation(
-                    "[VoteFix] executing 'game_alias {Alias}' then '{Command}' for passed {Issue} vote",
+                    "[VoteImprover] executing 'game_alias {Alias}' then '{Command}' for passed {Issue} vote",
                     alias, commandText, request.IssueType);
                 Server.ExecuteCommand($"game_alias {alias}");
             }
             else
             {
                 Logger.LogWarning(
-                    "[VoteFix] current game_type/game_mode has no alias; executing '{Command}' without game_alias",
+                    "[VoteImprover] current game_type/game_mode has no alias; executing '{Command}' without game_alias",
                     commandText);
             }
         }
         else
         {
-            Logger.LogInformation("[VoteFix] executing '{Command}' for passed {Issue} vote",
+            Logger.LogInformation("[VoteImprover] executing '{Command}' for passed {Issue} vote",
                 commandText, request.IssueType);
         }
 
@@ -538,7 +612,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         }
     }
 
-    private void CancelActiveVote(string reason)
+    public void CancelActiveVote(string reason)
     {
         _timeoutTimer?.Kill();
         _timeoutTimer = null;
@@ -546,11 +620,21 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         _executeTimer = null;
 
         var vote = _activeVote;
-        if (vote == null) return;
+        var callback = _onComplete;
         _activeVote = null;
-        Logger.LogInformation("[VoteFix] cancelling active vote: {Reason}", reason);
+        _onComplete = null;
+        if (vote == null) return;
+
+        Logger.LogInformation("[VoteImprover] cancelling active vote: {Reason}", reason);
         try { vote.Finish(HumanVoteOutcome.Cancelled, FindVoteController()); }
-        catch (Exception exception) { Logger.LogWarning(exception, "[VoteFix] cancel failed"); }
+        catch (Exception exception) { Logger.LogWarning(exception, "[VoteImprover] cancel failed"); }
+
+        if (callback == null) return;
+        try { callback(HumanVoteOutcome.Cancelled); }
+        catch (Exception exception)
+        {
+            Logger.LogError(exception, "[VoteImprover] programmatic vote cancel callback failed");
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -608,7 +692,7 @@ public sealed class BotVoteFix : BasePlugin, IPluginConfig<BotVoteFixConfig>
         }
         catch (Exception exception)
         {
-            Logger.LogDebug(exception, "[VoteFix] failed to read {ConVar}", name);
+            Logger.LogDebug(exception, "[VoteImprover] failed to read {ConVar}", name);
             return fallback;
         }
     }

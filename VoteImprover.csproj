@@ -3,10 +3,15 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>BotVoteFix</RootNamespace>
-    <AssemblyName>BotVoteFix</AssemblyName>
+    <RootNamespace>VoteImprover</RootNamespace>
+    <AssemblyName>VoteImprover</AssemblyName>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="VoteImproverApi\**" />
+    <None Remove="VoteImproverApi\**" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="CounterStrikeSharp.API" Version="1.0.371">
@@ -16,5 +21,6 @@
     <ProjectReference Include="..\CS2-Bot-Identity\csharp\BotIdentityApi\BotIdentityApi.csproj">
       <Private>false</Private>
     </ProjectReference>
+    <ProjectReference Include="VoteImproverApi\VoteImproverApi.csproj" />
   </ItemGroup>
 </Project>
