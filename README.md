@@ -56,9 +56,10 @@ to native voting instead).
 Version 2.1.0 also registers `voteimprover:api` so other plugins can start a
 server-initiated yes/no vote. The electorate is the same humans-only pool
 as `callvote` (HLTV, engine bots, and `botidentity:api` managed bots are
-excluded). Deploy `VoteImproverApi.dll` next to `VoteImprover.dll`. Consumers
-reference that assembly with `Private=false` and must not copy a second
-DLL into their own plugin folder.
+excluded). Deploy `VoteImproverApi.dll` next to `VoteImprover.dll` and also
+to `shared/VoteImproverApi/VoteImproverApi.dll` (same layout as
+`BotIdentityApi`). Consumers reference that assembly with `Private=false`
+and must not copy a second DLL into their own plugin folder.
 
 ```csharp
 var api = new PluginCapability<IHumanVoteApi>("voteimprover:api").Get();
@@ -83,8 +84,10 @@ Build with:
 dotnet build -c Release
 ```
 
-Copy `bin/Release/net10.0/VoteImprover.dll` and `VoteImproverApi.dll` to:
-`game/csgo/addons/counterstrikesharp/plugins/VoteImprover/`.
+Copy `bin/Release/net10.0/VoteImprover.dll` and `VoteImproverApi.dll` to
+`game/csgo/addons/counterstrikesharp/plugins/VoteImprover/`, and copy
+`VoteImproverApi.dll` to
+`game/csgo/addons/counterstrikesharp/shared/VoteImproverApi/`.
 
 The DLLs must sit directly in that directory, not in a nested
 `VoteImprover/VoteImprover/` folder. Do not leave the old
