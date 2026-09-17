@@ -100,20 +100,15 @@ The generated configuration is in:
 
 ### Client binds
 
-The plugin counts the client command `vote option1` (yes) and
-`vote option2` (no). If F1/F2 are bound to something else, the HUD appears
-but the ballot never arrives. Players should run this in the CS2 console
-(or put it in autoexec):
-
-```
-bind F1 "vote option1"
-bind F2 "vote option2"
-```
-
-Source bind syntax is `bind <key> "<command>"`. `bind voteoption1 F1` is
-the arguments reversed, and there is no `voteoption1` command. To test
-without a keybind, type `vote option1` or `vote option2` in the console
-while a vote is open.
+> [!IMPORTANT]
+> The plugin counts the client commands `vote option1` (yes) and `vote option2` (no). If F1/F2 are bound to something else, the HUD appears but the ballot never arrives. Run this in the CS2 console, or add it to autoexec:
+>
+> ```
+> bind F1 "vote option1"
+> bind F2 "vote option2"
+> ```
+>
+> Source bind syntax is `bind <key> "<command>"`. `bind voteoption1 F1` reverses the arguments, and there is no `voteoption1` command. To test without a keybind, type `vote option1` or `vote option2` in the console while a vote is open.
 
 ## Configuration
 
