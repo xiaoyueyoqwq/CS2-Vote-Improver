@@ -53,11 +53,14 @@ Without it, only the engine's `IsBot` flag is available and player-mode bots
 will be counted as humans (set `AllowWithoutBotIdentityApi=false` to fall back
 to native voting instead).
 
-Version 2.1.0 also registers `voteimprover:api` so other plugins can start a
-server-initiated yes/no vote. The electorate is the same humans-only pool
-as `callvote` (HLTV, engine bots, and `botidentity:api` managed bots are
-excluded). Deploy `VoteImproverApi.dll` next to `VoteImprover.dll` and also
-to `shared/VoteImproverApi/VoteImproverApi.dll` (same layout as
+Version 2.1.1 registers `voteimprover:api` so other plugins can start a
+server-initiated yes/no vote on the same HUD as `callvote`. The electorate
+is the same humans-only pool (HLTV, engine bots, and `botidentity:api`
+managed bots are excluded). `TryStartVote` fills `player_slot` with a
+connected human for display only and rewrites `#SFUI_vote` to
+`#SFUI_vote_restart_game`; otherwise Panorama draws no panel. Deploy
+`VoteImproverApi.dll` next to `VoteImprover.dll` and also to
+`shared/VoteImproverApi/VoteImproverApi.dll` (same layout as
 `BotIdentityApi`). Consumers reference that assembly with `Private=false`
 and must not copy a second DLL into their own plugin folder.
 
@@ -66,8 +69,8 @@ var api = new PluginCapability<IHumanVoteApi>("voteimprover:api").Get();
 api.TryStartVote(new HumanVoteRequest
 {
     IssueType = "Overtime",
-    DisplayString = "#SFUI_vote",
-    PassedString = "#SFUI_vote_passed",
+    DisplayString = "#SFUI_vote_restart_game",
+    PassedString = "#SFUI_vote_passed_restart_game",
     DetailsForUi = "是否进入加时赛？",
 }, outcome => { /* Passed / FailedQuorum / FailedYesMustExceedNo / Cancelled */ });
 ```
@@ -93,7 +96,7 @@ The DLLs must sit directly in that directory, not in a nested
 `VoteImprover/VoteImprover/` folder. Do not leave the old
 `plugins/BotVoteFix/` copy loaded at the same time; both would listen to
 `callvote` / `vote`. After a hot reload, `css_plugins list` should show
-`Vote Improver (2.1.0)`, and the log should contain `Vote Improver v2.1.0`.
+`Vote Improver (2.1.1)`, and the log should contain `Vote Improver v2.1.1`.
 
 The generated configuration is in:
 `addons/counterstrikesharp/configs/plugins/VoteImprover/VoteImprover.json`.
@@ -144,9 +147,8 @@ Issues missing from an existing config file are added disabled.
 - `callvote Kick` accepts both `Kick <userid> [reason]` and the quoted
   `Kick "<userid> <reason>"` form; the reason picks the matching
   `#SFUI_vote_kick_player_*` token.
-- Managed bots in *bot* mode are also excluded (they are `IsBot`); the
-  legacy BotHider auto-yes only fires on `vote_options`, which the takeover
-  never emits, and its synthetic `vote_cast` events are filtered by slot.
+- Managed bots identified by `botidentity:api` (CS2-Bot-Identity) are
+  excluded from the electorate. Do not load BotHider.
 
 ## Scope and limitations
 

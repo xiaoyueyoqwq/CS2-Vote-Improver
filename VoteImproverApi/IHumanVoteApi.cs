@@ -20,11 +20,14 @@ public sealed class HumanVoteRequest
     /// <summary>Issue name stored in logs and cooldown keys, e.g. "Overtime".</summary>
     public required string IssueType { get; init; }
 
-    /// <summary>Panorama token for VoteStart.disp_str.</summary>
-    public string DisplayString { get; init; } = "#SFUI_vote";
+    /// <summary>
+    /// Panorama token for VoteStart.disp_str. Empty or <c>#SFUI_vote</c> is
+    /// rewritten to <c>#SFUI_vote_restart_game</c> so the client draws a panel.
+    /// </summary>
+    public string DisplayString { get; init; } = "#SFUI_vote_restart_game";
 
     /// <summary>Panorama token for VotePass.disp_str.</summary>
-    public string PassedString { get; init; } = "#SFUI_vote_passed";
+    public string PassedString { get; init; } = "#SFUI_vote_passed_restart_game";
 
     /// <summary>Second HUD line. Use this for a custom Chinese question.</summary>
     public string DetailsForUi { get; init; } = "";
@@ -38,7 +41,8 @@ public interface IHumanVoteApi
     bool IsVoteActive { get; }
 
     /// <summary>
-    /// Starts a server-initiated yes/no vote on the native Panorama HUD.
+    /// Starts a server-initiated yes/no vote on the native Panorama HUD,
+    /// using a connected human's slot as VoteStart.player_slot (display only).
     /// Returns false when the plugin is disabled, a vote is already running,
     /// or there are no human voters. On success the HUD is shown and
     /// <paramref name="onComplete"/> runs once with the outcome.

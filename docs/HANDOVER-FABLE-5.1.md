@@ -53,7 +53,7 @@ CS2 没有公开的 `CVoteController::IsValidVoter` / `CBaseIssue::CountPotentia
 5. **失败就停。** 同一策略连试三次算噪音。报告实际日志行，换策略或问主人。
 6. **未经批准不改运行时。** 有玩家在线时禁止停服、换图、改 CVar、热重载、替换插件。手册优先于「我想测一下」。
 7. **Native Metamod 插件不能热重载。** 换 `.so` 必须空服或授权窗口 + 全量 CS2 重启（`stop.sh` / `start.sh`）。
-8. **禁止查看、引用、移植、部署 BotHider 的 native 源码**（Issue #30，维护者敌对）。仓库在 `/home/xiaoyueyoqwq/project/CS2-Bot-Hider/`。**可以读** BotHiderImpl 的 CSS、以及 BotHider 的 gamedata JSON / configs。**跳过** native `cpp` / `.so`。
+8. **身份层只走 CS2-Bot-Identity**（`botidentity:api` / `BotIdentity.so` / `BotIdentityImpl`）。不要加载、兼容、引用或部署 BotHider / BotHiderImpl / `bothider:api`。共享内存文件名 `/dev/shm/CS2BotHider_Slots` 是历史遗留，不是 BotHider 仍在服役。`/home/xiaoyueyoqwq/project/CS2-Bot-Hider/` 只作归档，不要再读 native 源码。
 9. **不要动这些有意保留的行为：** 双名字层、difficulty 2、BotAI 跳过的补丁、已恢复的低配 `botprofile.vpk`。
 10. **手册绑定：**
     - `/home/xiaoyueyoqwq/文档/CS2_服务器管理员维护手册_v1.0.md`
@@ -99,7 +99,7 @@ CS2 没有公开的 `CVoteController::IsValidVoter` / `CBaseIssue::CountPotentia
 `css_plugins list`：`Bot Vote Fix (1.1.2)`  
 `botidentity:api available`
 
-仍加载着遗留 **BotHiderImpl**（CSS）。它会按 2s / 0.25s 窗口用 Schema 写回 controller `m_steamID`，并在投票时给托管 BOT 打 HUD 自动 yes。`auto_vote_for_managed_bots=false` 配了也还会打。**自动 yes 不是超时原因**（yes 票足够过任何含 bot 的池子；超时是因为 Valve 内部法定人数仍把 bot 算进去）。
+当时交接现场还加载着遗留 **BotHiderImpl**（CSS）：按 2s / 0.25s 窗口用 Schema 写回 controller `m_steamID`，并在投票时给托管 BOT 打 HUD 自动 yes。**自动 yes 不是超时原因**（yes 票足够过任何含 bot 的池子；超时是因为 Valve 内部法定人数仍把 bot 算进去）。当前不要再加载 BotHiderImpl。身份层只走 CS2-Bot-Identity。
 
 ---
 
@@ -118,7 +118,7 @@ CS2 没有公开的 `CVoteController::IsValidVoter` / `CBaseIssue::CountPotentia
   → Valve 处理 callvote，发出 vote_options（同步，在 CountPotentialVoters 之前——这是 CS:GO 顺序，CS2 未证实同源）
       BotVoteFix OnVoteOptions（同步，不是 NextFrame）
         Schema.SetSchemaValue(controller, CBasePlayerController.m_steamID, 0)  不 SetStateChanged
-        开始 0.10s refresh：重清 Schema SteamID（对抗 BotHiderImpl），改 CVoteController 字段（只是 HUD/日志探针）
+        开始 0.10s refresh：重清 Schema SteamID（当时为了对抗遗留 BotHiderImpl），改 CVoteController 字段（只是 HUD/日志探针）
   → DispatchConCommand Post
       ScheduleVoteTransactionEnd(3 GameFrame)
   → GameFrame_Post × 3：Reassert 标记；第一拍再探测一次引擎身份
@@ -126,10 +126,10 @@ CS2 没有公开的 `CVoteController::IsValidVoter` / `CBaseIssue::CountPotentia
   → 3 帧结束：把伪装写回去（ClearFakePlayer、SteamID 拷贝、清 0x100）
 ```
 
-日常伪装（`ApplyDisguise`，连接时）：`ClearFakePlayer` + `WriteSteamId(synthetic)` + 清 controller `0x100`。**不写** controller Schema `m_steamID`（那是 BotHiderImpl CSS 在写）。  
+日常伪装（`ApplyDisguise`，连接时）：`ClearFakePlayer` + `WriteSteamId(synthetic)` + 清 controller `0x100`。**不写** controller Schema `m_steamID`。  
 断开 `RestoreIdentity`：`SetFakePlayer` + `0x100` + `WriteSteamId(0)`。同样不写 Schema `m_steamID`。
 
-CSS `CCSPlayerController.IsBot` = `m_fFlags & FL_FAKECLIENT`。BotHiderImpl 还有 Harmony postfix，只影响 C#，Valve 看不见。  
+CSS `CCSPlayerController.IsBot` = `m_fFlags & FL_FAKECLIENT`。托管身份只走 BotIdentity；不要再依赖 BotHiderImpl 的 Harmony postfix。  
 player 模式 **从不拆** pawn 上的 `CCSBot*`。
 
 SteamID64 公式：`76561197960265728 + accountid`，和 userinfo `[U:1:accountid]` 对得上。
@@ -270,10 +270,10 @@ BotVoteFix（本分支）：
 - `BotVoteFix.csproj` — CSS API 1.0.371，net10.0，引用 `CS2-Bot-Identity/csharp/BotIdentityApi`
 - `README.md` — 已写明换图才是测试，CVoteController 改写无效
 
-BotHiderImpl（可读 CSS，勿读 native）：
+BotHiderImpl（归档，不要加载）：
 
-- 线上仍在跑；会写回 Schema SteamID；HUD 自动 yes
-- Harmony `IsBot` postfix 只影响 C#
+- 2026-09-05 交接现场还在跑：写回 Schema SteamID、HUD 自动 yes
+- 当前身份层只走 CS2-Bot-Identity，不要再读或部署这条 CSS
 
 ---
 

@@ -79,7 +79,7 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
     private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
     public override string ModuleName => "Vote Improver";
-    public override string ModuleVersion => "2.1.0";
+    public override string ModuleVersion => "2.1.1";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
@@ -370,12 +370,12 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
         {
             Enabled = true,
             Scope = VoteScope.Global,
-            DisplayString = string.IsNullOrWhiteSpace(request.DisplayString) ? "#SFUI_vote" : request.DisplayString,
-            PassedString = string.IsNullOrWhiteSpace(request.PassedString) ? "#SFUI_vote_passed" : request.PassedString,
+            DisplayString = ServerInitiatedDisplayString(request.DisplayString),
+            PassedString = ServerInitiatedPassedString(request.PassedString),
             Command = "",
         };
 
-        var callRequest = new CallVoteRequest
+        var probe = new CallVoteRequest
         {
             IssueType = request.IssueType,
             Details = request.DetailsForUi,
@@ -385,15 +385,62 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
             CallerTeam = CsTeam.None,
         };
 
-        var voters = CollectHumanVoters(callRequest);
+        var voters = CollectHumanVoters(probe);
         if (voters.Count == 0)
         {
             Logger.LogWarning("[VoteImprover] TryStartVote {Issue}: no human voters", request.IssueType);
             return false;
         }
 
+        int displayCaller = PickDisplayCallerSlot(voters);
+        var callRequest = new CallVoteRequest
+        {
+            IssueType = probe.IssueType,
+            Details = probe.Details,
+            DetailsForUi = probe.DetailsForUi,
+            Issue = issue,
+            CallerSlot = displayCaller,
+            CallerTeam = CsTeam.None,
+        };
+
+        Logger.LogInformation(
+            "[VoteImprover] TryStartVote {Issue} displayCaller={Slot} disp_str={Disp}",
+            request.IssueType, displayCaller, issue.DisplayString);
         StartVote(callRequest, voters, FindVoteController(), onComplete, request.DurationSeconds);
         return true;
+    }
+
+    /// <summary>
+    /// Panorama ignores VoteStart when player_slot is -1 or disp_str is the
+    /// generic #SFUI_vote token. Server-initiated votes reuse a real human
+    /// slot for display only; that player is not auto-cast as yes.
+    /// </summary>
+    private static string ServerInitiatedDisplayString(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token) || token == "#SFUI_vote")
+            return "#SFUI_vote_restart_game";
+        return token;
+    }
+
+    private static string ServerInitiatedPassedString(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token) || token == "#SFUI_vote_passed")
+            return "#SFUI_vote_passed_restart_game";
+        return token;
+    }
+
+    private static int PickDisplayCallerSlot(List<int> voters)
+    {
+        foreach (int slot in voters)
+        {
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player == null || !player.IsValid)
+                continue;
+            if (player.Team is CsTeam.Terrorist or CsTeam.CounterTerrorist)
+                return slot;
+        }
+
+        return voters[0];
     }
 
     private void StartVote(
