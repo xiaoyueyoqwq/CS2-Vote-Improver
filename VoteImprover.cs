@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Serialization;
 using BotIdentityApi;
 using VoteImproverApi;
@@ -79,7 +80,7 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
     private readonly Dictionary<ulong, float> _callerCooldownUntil = new();
 
     public override string ModuleName => "Vote Improver";
-    public override string ModuleVersion => "2.1.1";
+    public override string ModuleVersion => "2.1.2";
     public override string ModuleAuthor => "CS2-Vote-Improver";
     public override string ModuleDescription =>
         "Runs whitelisted callvote issues with a humans-only electorate (managed bots excluded via botidentity:api).";
@@ -176,8 +177,8 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
 
         if (!string.IsNullOrEmpty(issue.AllowConVar))
         {
-            var allow = ConVar.Find(issue.AllowConVar);
-            if (allow != null && !allow.GetPrimitiveValue<bool>())
+            var allow = ConVar<bool>.Find(issue.AllowConVar);
+            if (allow != null && !allow.Value)
             {
                 Logger.LogDebug("[VoteImprover] callvote {Issue}: {ConVar} is 0, native handles it", issueType, issue.AllowConVar);
                 return HookResult.Continue;
@@ -206,8 +207,8 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
 
         if (callerTeam != CsTeam.Terrorist && callerTeam != CsTeam.CounterTerrorist)
         {
-            var allowSpectators = ConVar.Find("sv_vote_allow_spectators");
-            if (allowSpectators == null || !allowSpectators.GetPrimitiveValue<bool>())
+            var allowSpectators = ConVar<bool>.Find("sv_vote_allow_spectators");
+            if (allowSpectators == null || !allowSpectators.Value)
                 return RejectCall(caller, VoteFailReason.Spectator);
         }
 
@@ -633,13 +634,13 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
     /// </summary>
     private static string? CurrentGameAlias()
     {
-        var type = ConVar.Find("game_type");
-        var mode = ConVar.Find("game_mode");
+        var type = ConVar<int>.Find("game_type");
+        var mode = ConVar<int>.Find("game_mode");
         if (type == null || mode == null) return null;
 
         try
         {
-            return (type.GetPrimitiveValue<int>(), mode.GetPrimitiveValue<int>()) switch
+            return (type.Value, mode.Value) switch
             {
                 (0, 0) => "casual",
                 (0, 1) => "competitive",
@@ -721,26 +722,10 @@ public sealed class VoteImprover : BasePlugin, IPluginConfig<VoteImproverConfig>
 
     private float ReadFloat(string name, float fallback, float min, float max)
     {
-        var cvar = ConVar.Find(name);
+        var cvar = ConVar<float>.Find(name);
         if (cvar == null) return fallback;
-        try
-        {
-            float value = cvar.Type switch
-            {
-                ConVarType.Float32 => cvar.GetPrimitiveValue<float>(),
-                ConVarType.Float64 => (float)cvar.GetPrimitiveValue<double>(),
-                ConVarType.Int32 => cvar.GetPrimitiveValue<int>(),
-                ConVarType.Int16 => cvar.GetPrimitiveValue<short>(),
-                ConVarType.Int64 => cvar.GetPrimitiveValue<long>(),
-                ConVarType.UInt32 => cvar.GetPrimitiveValue<uint>(),
-                _ => fallback,
-            };
-            return Math.Clamp(value, min, max);
-        }
-        catch (Exception exception)
-        {
-            Logger.LogDebug(exception, "[VoteImprover] failed to read {ConVar}", name);
-            return fallback;
-        }
+        return float.TryParse(cvar.ValueAsString, NumberStyles.Float, CultureInfo.InvariantCulture, out float value)
+            ? Math.Clamp(value, min, max)
+            : fallback;
     }
 }
